@@ -1,0 +1,827 @@
+import json
+import os
+from datetime import datetime, timedelta, timezone
+
+
+def generate_incidents():
+    incidents = []
+
+    # Base timestamp start: 14 months ago
+    base_time = datetime(2023, 11, 1, 9, 0, 0, tzinfo=timezone.utc)
+
+    # 6 families x 5 incidents = 30 incidents
+    # Families:
+    # 1. DB connection-pool exhaustion
+    # 2. Redis eviction storms
+    # 3. Bad deploys
+    # 4. Expired certificates
+    # 5. Memory leaks
+    # 6. Disk-full / log-volume
+
+    # Look-alikes to include:
+    # INC-105 (Family 1 look-alike): DB connection pool exhausted, BUT root cause was a Bad Deploy releasing unclosed connections.
+    # INC-110 (Family 2 look-alike): Redis eviction storm symptom, BUT root cause was Memory Leak in Redis sidecar / worker caching infinite keys.
+    # INC-115 (Family 3 look-alike): Latency spike resembling DB pool exhaustion, BUT root cause was Bad Deploy setting zero timeout.
+
+    # Incident 1..5: DB connection-pool exhaustion
+    incidents.append({
+        "id": "INC-101",
+        "timestamp": (base_time + timedelta(days=12, hours=3)).isoformat(),
+        "service": "checkout-api",
+        "severity": "SEV-1",
+        "title": "Checkout DB Connection Pool Exhaustion under high traffic",
+        "logs": [
+            "[2023-11-13T12:00:01Z] [checkout-api] INFO [203.0.113.10] Request POST /api/v1/checkout started",
+            "[2023-11-13T12:00:05Z] [checkout-api] WARN [203.0.113.10] DB pool active connections: 98/100 (98% capacity)",
+            "[2023-11-13T12:00:10Z] [checkout-api] ERROR [203.0.113.12] psycopg2.OperationalError: FATAL: remaining connection slots are reserved for non-replication superuser connections",
+            "[2023-11-13T12:00:12Z] [checkout-api] ERROR [203.0.113.12] sqlalchemy.exc.TimeoutError: QueuePool limit of size 100 overflow 20 reached, connection timed out, timeout 10.00",
+            "[2023-11-13T12:00:15Z] [checkout-api] ERROR [203.0.113.14] HTTP 500 Internal Server Error returned to client",
+            "[2023-11-13T12:00:20Z] [checkout-api] CRITICAL [203.0.113.14] Healthcheck failed: Unable to acquire database connection from pool within 5000ms",
+            "[2023-11-13T12:00:25Z] [checkout-api] WARN [203.0.113.15] Connection pool exhausted. Waiting threads: 142",
+            "[2023-11-13T12:00:30Z] [checkout-api] ERROR [203.0.113.15] Failed to execute query 'SELECT * FROM carts WHERE user_id = $1': Pool full",
+            "[2023-11-13T12:00:35Z] [checkout-api] ERROR [203.0.113.18] High latency detected on /checkout endpoint (>12000ms)"
+        ],
+        "root_cause": "Database connection pool max_size was set to 100, which was insufficient during marketing flash sale traffic peak, causing thread queue backup.",
+        "failed_first_step": "Restarting the checkout-api service pods without increasing pool size (connections immediately maxed out again upon startup).",
+        "resolution_steps": [
+            "Increase max pool size from 100 to 300 in checkout-api Helm values.",
+            "Increase PostgreSQL max_connections setting on orders-db primary node to 500.",
+            "Perform rolling restart of checkout-api deployments."
+        ],
+        "runbook_used": "runbook-db-pool-exhaustion.md",
+        "time_to_resolve": "35 minutes"
+    })
+
+    incidents.append({
+        "id": "INC-102",
+        "timestamp": (base_time + timedelta(days=28, hours=14)).isoformat(),
+        "service": "orders-db",
+        "severity": "SEV-2",
+        "title": "Orders DB connection leak in background worker jobs",
+        "logs": [
+            "[2023-11-29T23:10:00Z] [orders-db] WARN [203.0.113.20] Active client connections count reaching threshold: 450/500",
+            "[2023-11-29T23:12:00Z] [inventory-worker] ERROR [203.0.113.22] DBConnectionError: Could not obtain connection from pool within 15 seconds",
+            "[2023-11-29T23:13:30Z] [orders-db] ERROR [203.0.113.20] postgres[4821]: [3-1] FATAL: sorry, too many clients already",
+            "[2023-11-29T23:14:00Z] [orders-db] WARNING [203.0.113.20] Idle in transaction connections: 310 detected from inventory-worker service",
+            "[2023-11-29T23:15:00Z] [inventory-worker] ERROR [203.0.113.22] Worker task process_order_async failed due to DB connection timeout",
+            "[2023-11-29T23:16:00Z] [orders-db] ERROR [203.0.113.20] Client connection pool exhausted by unclosed sessions",
+            "[2023-11-29T23:17:00Z] [orders-db] INFO [203.0.113.20] Terminating idle connections over 10 minutes old",
+            "[2023-11-29T23:18:00Z] [inventory-worker] WARN [203.0.113.22] Retrying DB connection 3/5..."
+        ],
+        "root_cause": "Inventory worker background task failed to close database sessions when encountering unexpected API timeout, leaking connections until PostgreSQL limit was hit.",
+        "failed_first_step": None,
+        "resolution_steps": [
+            "Kill all 'idle in transaction' PostgreSQL connections using SELECT pg_terminate_backend(pid).",
+            "Deploy hotfix patch to inventory-worker ensuring scoped db_session context management in try/finally block."
+        ],
+        "runbook_used": "runbook-pg-connection-leak.md",
+        "time_to_resolve": "25 minutes"
+    })
+
+    incidents.append({
+        "id": "INC-103",
+        "timestamp": (base_time + timedelta(days=45, hours=8)).isoformat(),
+        "service": "payments-svc",
+        "severity": "SEV-1",
+        "title": "Payments service DB pool starvation due to slow downstream gateway responses",
+        "logs": [
+            "[2023-12-16T17:05:10Z] [payments-svc] INFO [203.0.113.30] Processing payment batch for vendor Stripe",
+            "[2023-12-16T17:06:00Z] [payments-svc] WARN [203.0.113.30] Stripe API response time elevated (8500ms)",
+            "[2023-12-16T17:07:15Z] [payments-svc] ERROR [203.0.113.32] DB pool thread starvation: 50/50 threads waiting for DB connection while holding payment lock",
+            "[2023-12-16T17:08:00Z] [payments-svc] ERROR [203.0.113.32] TimeoutError: QueuePool limit 50 reached",
+            "[2023-12-16T17:08:30Z] [payments-svc] ERROR [203.0.113.35] Unable to process payment requests - HTTP 503",
+            "[2023-12-16T17:09:00Z] [payments-svc] CRITICAL [203.0.113.35] Payment gateway callback handler pool exhausted",
+            "[2023-12-16T17:09:30Z] [payments-svc] WARN [203.0.113.35] Circuit breaker status: OPEN for Stripe payment processing",
+            "[2023-12-16T17:10:00Z] [payments-svc] ERROR [203.0.113.35] Failed transactions rate: 94%"
+        ],
+        "root_cause": "Payment processing held open DB transactions while waiting for slow external Stripe API calls, starving the connection pool for incoming payment requests.",
+        "failed_first_step": "Increasing DB connection pool size from 50 to 150 (this just caused database CPU spike without fixing the underlying transaction lock contention).",
+        "resolution_steps": [
+            "Enable payment gateway circuit breaker to fast-fail slow external calls.",
+            "Refactor payments transaction boundaries so DB transactions do not wrap outbound HTTP network calls."
+        ],
+        "runbook_used": "runbook-payments-starvation.md",
+        "time_to_resolve": "50 minutes"
+    })
+
+    incidents.append({
+        "id": "INC-104",
+        "timestamp": (base_time + timedelta(days=60, hours=2)).isoformat(),
+        "service": "auth-gateway",
+        "severity": "SEV-2",
+        "title": "Auth Gateway connection pool depletion during user session refresh spike",
+        "logs": [
+            "[2023-12-31T23:45:00Z] [auth-gateway] INFO [203.0.113.40] Token validation request rate: 12,000 req/min",
+            "[2023-12-31T23:46:10Z] [auth-gateway] WARN [203.0.113.40] PostgreSQL connection pool usage: 95/100",
+            "[2023-12-31T23:47:00Z] [auth-gateway] ERROR [203.0.113.42] Timeout waiting for connection from pool: 10000ms",
+            "[2023-12-31T23:47:30Z] [auth-gateway] ERROR [203.0.113.42] Authentication failed for user token verification: DB pool timeout",
+            "[2023-12-31T23:48:00Z] [auth-gateway] WARN [203.0.113.45] User authentication endpoint returning 504 Gateway Timeout",
+            "[2023-12-31T23:48:30Z] [auth-gateway] ERROR [203.0.113.45] Pool acquire timeout: 10.0s elapsed, pool size 100",
+            "[2023-12-31T23:49:00Z] [auth-gateway] CRITICAL [203.0.113.45] Auth gateway health check failing on /health/db",
+            "[2023-12-31T23:50:00Z] [auth-gateway] ERROR [203.0.113.45] Session storage read failure"
+        ],
+        "root_cause": "New Year's Eve traffic burst triggered simultaneous token refreshes, hitting DB directly because auth token cache had expired.",
+        "failed_first_step": None,
+        "resolution_steps": [
+            "Pre-warm auth token cache in Redis to intercept token validation queries.",
+            "Scale auth-gateway read replica pool and bump auth connection pool size to 250."
+        ],
+        "runbook_used": "runbook-auth-pool-exhaustion.md",
+        "time_to_resolve": "20 minutes"
+    })
+
+    # LOOK-ALIKE INCIDENT 1 (Look-alike across families: DB pool symptoms, but root cause was Bad Deploy)
+    incidents.append({
+        "id": "INC-105",
+        "timestamp": (base_time + timedelta(days=75, hours=11)).isoformat(),
+        "service": "search-indexer",
+        "severity": "SEV-1",
+        "title": "Search Indexer DB connection pool exhausted after bad v2.4.1 deployment",
+        "logs": [
+            "[2024-01-15T10:15:00Z] [search-indexer] INFO [203.0.113.50] Deployed version v2.4.1 to cluster",
+            "[2024-01-15T10:17:00Z] [search-indexer] WARN [203.0.113.50] DB active connections rapidly rising: 20 -> 100 in 2 minutes",
+            "[2024-01-15T10:18:30Z] [search-indexer] ERROR [203.0.113.52] sqlalchemy.exc.TimeoutError: QueuePool limit of size 100 overflow 10 reached",
+            "[2024-01-15T10:19:00Z] [search-indexer] ERROR [203.0.113.52] Could not acquire connection from pool, pool size 100",
+            "[2024-01-15T10:20:00Z] [search-indexer] CRITICAL [203.0.113.55] Search indexing pipeline halted: DB connection pool exhausted",
+            "[2024-01-15T10:21:00Z] [search-indexer] ERROR [203.0.113.55] Worker thread crashed without returning connection to pool",
+            "[2024-01-15T10:22:00Z] [search-indexer] ERROR [203.0.113.55] Connection leak detected in document parser loop",
+            "[2024-01-15T10:23:00Z] [search-indexer] WARN [203.0.113.55] Retrying indexing job..."
+        ],
+        "root_cause": "Look-alike incident: Initial alert looked like standard DB pool size limit, but root cause was a Bad Deploy in v2.4.1 which removed the 'finally: session.close()' statement in document_parser.py.",
+        "failed_first_step": "Increasing PostgreSQL connection pool size to 300 (failed because connections continued leaking continuously until hitting 300).",
+        "resolution_steps": [
+            "Roll back search-indexer deployment from v2.4.1 to v2.4.0.",
+            "Restart search-indexer pods to purge leaked connections."
+        ],
+        "runbook_used": "runbook-deploy-rollback.md",
+        "time_to_resolve": "18 minutes"
+    })
+
+    # Incident 6..10: Redis eviction storms
+    incidents.append({
+        "id": "INC-106",
+        "timestamp": (base_time + timedelta(days=90, hours=5)).isoformat(),
+        "service": "checkout-api",
+        "severity": "SEV-1",
+        "title": "Redis Eviction Storm causing Checkout API session cache invalidation",
+        "logs": [
+            "[2024-01-30T14:20:00Z] [checkout-api] INFO [198.51.100.10] Redis cache memory usage: 98.4% of 8GB",
+            "[2024-01-30T14:21:05Z] [checkout-api] WARN [198.51.100.10] Redis maxmemory reached, volatile-lru eviction policy triggered",
+            "[2024-01-30T14:21:30Z] [checkout-api] ERROR [198.51.100.12] Redis evictions per second spiked from 50/s to 45,000/s",
+            "[2024-01-30T14:22:00Z] [checkout-api] ERROR [198.51.100.12] Cache miss rate increased to 92% on user session keys",
+            "[2024-01-30T14:22:30Z] [checkout-api] ERROR [198.51.100.15] OOM command not allowed when used memory > 'maxmemory'",
+            "[2024-01-30T14:23:00Z] [checkout-api] CRITICAL [198.51.100.15] Checkout session lookup failing, forcing fallback to primary database",
+            "[2024-01-30T14:23:30Z] [checkout-api] ERROR [198.51.100.18] Latency spike on checkout page: p99 > 8500ms due to DB thundering herd",
+            "[2024-01-30T14:24:00Z] [checkout-api] WARN [198.51.100.18] Redis eviction storm actively dropping active checkout carts"
+        ],
+        "root_cause": "Large uncompressed product catalog payload was cached in Redis without TTL, filling maxmemory (8GB) and triggering aggressive volatile-lru eviction of active session keys.",
+        "failed_first_step": "Flushing all Redis keys with FLUSHALL (this caused complete database thundering herd and crashed orders-db).",
+        "resolution_steps": [
+            "Change maxmemory policy to allkeys-lru and increase Redis memory allocation to 16GB.",
+            "Flush only catalog keys using UNLINK in batches and set strict TTL (1 hour) on large catalog entries."
+        ],
+        "runbook_used": "runbook-redis-eviction-storm.md",
+        "time_to_resolve": "40 minutes"
+    })
+
+    incidents.append({
+        "id": "INC-107",
+        "timestamp": (base_time + timedelta(days=105, hours=16)).isoformat(),
+        "service": "inventory-worker",
+        "severity": "SEV-2",
+        "title": "Redis Eviction Storm on background job queue cluster",
+        "logs": [
+            "[2024-02-14T08:10:00Z] [inventory-worker] INFO [198.51.100.20] Enqueuing 50,000 inventory update jobs",
+            "[2024-02-14T08:11:00Z] [inventory-worker] WARN [198.51.100.20] Redis instance inventory-redis memory usage 99%",
+            "[2024-02-14T08:12:00Z] [inventory-worker] ERROR [198.51.100.22] Redis evicted 12,000 enqueued job payload keys!",
+            "[2024-02-14T08:12:30Z] [inventory-worker] ERROR [198.51.100.22] KeyNotFoundError: job_payload:inv_99812 no longer exists in cache",
+            "[2024-02-14T08:13:00Z] [inventory-worker] ERROR [198.51.100.25] Inventory sync worker failing: missing job metadata",
+            "[2024-02-14T08:14:00Z] [inventory-worker] CRITICAL [198.51.100.25] High eviction rate on Redis queue node: 15,000 keys/sec evicted",
+            "[2024-02-14T08:15:00Z] [inventory-worker] WARN [198.51.100.25] Worker retry loop failing for lost job payloads",
+            "[2024-02-14T08:16:00Z] [inventory-worker] ERROR [198.51.100.25] Data inconsistency in inventory counts"
+        ],
+        "root_cause": "Background job payload keys were stored without noeviction policy on a shared Redis cluster running LRU eviction.",
+        "failed_first_step": None,
+        "resolution_steps": [
+            "Separate queue storage from cache storage onto dedicated Redis cluster with maxmemory-policy noeviction.",
+            "Re-trigger inventory sync job from dead letter storage."
+        ],
+        "runbook_used": "runbook-redis-queues.md",
+        "time_to_resolve": "28 minutes"
+    })
+
+    incidents.append({
+        "id": "INC-108",
+        "timestamp": (base_time + timedelta(days=120, hours=1)).isoformat(),
+        "service": "auth-gateway",
+        "severity": "SEV-1",
+        "title": "Auth token cache eviction storm causing auth outage",
+        "logs": [
+            "[2024-03-01T03:00:10Z] [auth-gateway] INFO [198.51.100.30] Nightly cron job started writing session analytics into Redis",
+            "[2024-03-01T03:02:00Z] [auth-gateway] WARN [198.51.100.30] Redis memory maxed out at 4GB",
+            "[2024-03-01T03:03:00Z] [auth-gateway] ERROR [198.51.100.32] Eviction storm triggered: 100k active JWT session tokens evicted",
+            "[2024-03-01T03:04:00Z] [auth-gateway] ERROR [198.51.100.32] Mass user logout reported across web and mobile apps",
+            "[2024-03-01T03:05:00Z] [auth-gateway] ERROR [198.51.100.35] Auth gateway CPU 100% processing re-login requests",
+            "[2024-03-01T03:06:00Z] [auth-gateway] CRITICAL [198.51.100.35] Redis command latencies > 2000ms",
+            "[2024-03-01T03:07:00Z] [auth-gateway] WARN [198.51.100.35] Client connection drops on auth-gateway cluster",
+            "[2024-03-01T03:08:00Z] [auth-gateway] ERROR [198.51.100.35] Login service unavailable"
+        ],
+        "root_cause": "Analytics job wrote un-expiring keys into auth Redis cluster, triggering LRU eviction of valid JWT auth tokens.",
+        "failed_first_step": "Restarting auth-gateway servers (didn't help because Redis memory was still maxed out and evicting tokens).",
+        "resolution_steps": [
+            "Purge analytics keys matching prefix 'analytics:*' using SCAN and UNLINK.",
+            "Isolate analytics job to write to PostgreSQL analytics store instead of auth Redis cluster."
+        ],
+        "runbook_used": "runbook-redis-eviction-storm.md",
+        "time_to_resolve": "32 minutes"
+    })
+
+    incidents.append({
+        "id": "INC-109",
+        "timestamp": (base_time + timedelta(days=135, hours=9)).isoformat(),
+        "service": "search-indexer",
+        "severity": "SEV-2",
+        "title": "Search index cache eviction cascade under heavy read query burst",
+        "logs": [
+            "[2024-03-16T11:30:00Z] [search-indexer] INFO [198.51.100.40] Search query load increased to 8,000 QPS",
+            "[2024-03-16T11:32:00Z] [search-indexer] WARN [198.51.100.40] Redis search-cache memory 97% full",
+            "[2024-03-16T11:33:00Z] [search-indexer] ERROR [198.51.100.42] Redis eviction rate: 22,000 keys/sec",
+            "[2024-03-16T11:34:00Z] [search-indexer] ERROR [198.51.100.42] Search result latency degradation (p95 > 4200ms)",
+            "[2024-03-16T11:35:00Z] [search-indexer] ERROR [198.51.100.45] Redis OOM errors on SETEX operations",
+            "[2024-03-16T11:36:00Z] [search-indexer] CRITICAL [198.51.100.45] Elasticsearch downstream fallback overloaded with un-cached queries",
+            "[2024-03-16T11:37:00Z] [search-indexer] WARN [198.51.100.45] Search service degraded state active",
+            "[2024-03-16T11:38:00Z] [search-indexer] ERROR [198.51.100.45] Indexer worker thread timeout"
+        ],
+        "root_cause": "Search query cache keys did not use compression and TTL was set to 7 days, causing memory exhaustion and eviction cascade.",
+        "failed_first_step": None,
+        "resolution_steps": [
+            "Lower search cache TTL from 7 days to 2 hours.",
+            "Enable msgpack compression on search result payload serialization before writing to Redis."
+        ],
+        "runbook_used": "runbook-search-cache.md",
+        "time_to_resolve": "22 minutes"
+    })
+
+    # LOOK-ALIKE INCIDENT 2 (Symptom: Redis eviction storm, Root cause: Memory leak in worker caching)
+    incidents.append({
+        "id": "INC-110",
+        "timestamp": (base_time + timedelta(days=150, hours=18)).isoformat(),
+        "service": "payments-svc",
+        "severity": "SEV-1",
+        "title": "Redis Eviction Storm in Payments Svc caused by memory leak in payment receipt generator",
+        "logs": [
+            "[2024-03-31T20:10:00Z] [payments-svc] INFO [198.51.100.50] Processing high volume evening payment settlements",
+            "[2024-03-31T20:12:00Z] [payments-svc] WARN [198.51.100.50] Redis payment-cache maxmemory reached (12GB)",
+            "[2024-03-31T20:13:00Z] [payments-svc] ERROR [198.51.100.52] Redis eviction storm: 35,000 keys evicted/sec",
+            "[2024-03-31T20:14:00Z] [payments-svc] ERROR [198.51.100.52] Payment idempotent tokens being evicted before processing finishes!",
+            "[2024-03-31T20:15:00Z] [payments-svc] CRITICAL [198.51.100.55] Duplicate payment charge risk detected due to missing idempotency keys",
+            "[2024-03-31T20:16:00Z] [payments-svc] ERROR [198.51.100.55] OOM command not allowed in payment cache",
+            "[2024-03-31T20:17:00Z] [payments-svc] WARN [198.51.100.55] Payment processing paused by safety guardrail",
+            "[2024-03-31T20:18:00Z] [payments-svc] ERROR [198.51.100.55] Receipt generator worker memory leak filling cache with raw PDF binaries"
+        ],
+        "root_cause": "Look-alike incident: Symptoms matched a Redis eviction storm, but root cause was a Memory Leak / bug in payment receipt generator which stored full uncompressed PDF raw bytes directly in Redis without expiry.",
+        "failed_first_step": "Increasing Redis instance size to 32GB (failed because PDF binaries filled 32GB in under 10 minutes).",
+        "resolution_steps": [
+            "Disable PDF raw byte caching in Redis and store receipts directly in S3 bucket.",
+            "Run script to delete all pdf_raw:* keys from Redis using UNLINK."
+        ],
+        "runbook_used": "runbook-payments-cache-leak.md",
+        "time_to_resolve": "30 minutes"
+    })
+
+    # Incident 11..15: Bad deploys
+    incidents.append({
+        "id": "INC-111",
+        "timestamp": (base_time + timedelta(days=165, hours=10)).isoformat(),
+        "service": "checkout-api",
+        "severity": "SEV-1",
+        "title": "Bad deploy release v3.1.0 broke checkout routing logic",
+        "logs": [
+            "[2024-04-15T09:00:00Z] [checkout-api] INFO [192.0.2.10] Deploying release release-v3.1.0 to production",
+            "[2024-04-15T09:02:15Z] [checkout-api] WARN [192.0.2.10] Pod checkout-api-78d9f-x291a started with version v3.1.0",
+            "[2024-04-15T09:03:00Z] [checkout-api] ERROR [192.0.2.12] TypeError: Cannot read property 'id' of undefined in CheckoutController.ts:88",
+            "[2024-04-15T09:03:30Z] [checkout-api] ERROR [192.0.2.12] Unhandled Promise Rejection: Invalid payment method object schema",
+            "[2024-04-15T09:04:00Z] [checkout-api] ERROR [192.0.2.15] HTTP 500 status rate spiked to 88% on POST /api/v2/checkout/submit",
+            "[2024-04-15T09:04:30Z] [checkout-api] CRITICAL [192.0.2.15] Kubernetes readiness probe failed for 6/10 pods",
+            "[2024-04-15T09:05:00Z] [checkout-api] WARN [192.0.2.15] Rollback criteria met: Error rate > 5% for > 2 minutes",
+            "[2024-04-15T09:06:00Z] [checkout-api] ERROR [192.0.2.18] Checkout pipeline totally unresponsive"
+        ],
+        "root_cause": "Bad deploy v3.1.0 included a breaking schema change in CheckoutController payload parsing without backwards compatibility for mobile app v2 endpoints.",
+        "failed_first_step": "Attempting to hotfix code directly in pod via kubectl exec (failed due to read-only container filesystem and multi-pod drift).",
+        "resolution_steps": [
+            "Execute automated helm rollback to previous revision v3.0.9.",
+            "Verify pod status and confirm error rate dropped to 0%."
+        ],
+        "runbook_used": "runbook-deploy-rollback.md",
+        "time_to_resolve": "12 minutes"
+    })
+
+    incidents.append({
+        "id": "INC-112",
+        "timestamp": (base_time + timedelta(days=180, hours=14)).isoformat(),
+        "service": "auth-gateway",
+        "severity": "SEV-1",
+        "title": "Bad deploy v1.8.2 introduced invalid environment variable configuration",
+        "logs": [
+            "[2024-04-30T15:00:00Z] [auth-gateway] INFO [192.0.2.20] Deploying tag v1.8.2 to production cluster",
+            "[2024-04-30T15:01:00Z] [auth-gateway] ERROR [192.0.2.20] KeyError: 'AUTH_JWT_SECRET_KEY' environment variable missing",
+            "[2024-04-30T15:01:30Z] [auth-gateway] CRITICAL [192.0.2.20] Container CrashLoopBackOff: AuthGateway failed to boot",
+            "[2024-04-30T15:02:00Z] [auth-gateway] ERROR [192.0.2.22] 0/8 pods ready in auth-gateway deployment",
+            "[2024-04-30T15:02:30Z] [auth-gateway] ERROR [192.0.2.22] Ingress controller returning 503 Service Temporarily Unavailable",
+            "[2024-04-30T15:03:00Z] [auth-gateway] WARN [192.0.2.25] All external user requests failing authentication",
+            "[2024-04-30T15:03:30Z] [auth-gateway] ERROR [192.0.2.25] Fatal startup configuration exception",
+            "[2024-04-30T15:04:00Z] [auth-gateway] CRITICAL [192.0.2.25] Global outage on authentication service"
+        ],
+        "root_cause": "Bad deploy release v1.8.2 renamed secret environment variable key from JWT_SECRET to AUTH_JWT_SECRET_KEY without updating Kubernetes Secret manifest.",
+        "failed_first_step": None,
+        "resolution_steps": [
+            "Update Kubernetes Secret manifest to map AUTH_JWT_SECRET_KEY.",
+            "Roll back deployment to v1.8.1 while secret changes were reviewed."
+        ],
+        "runbook_used": "runbook-deploy-rollback.md",
+        "time_to_resolve": "15 minutes"
+    })
+
+    incidents.append({
+        "id": "INC-113",
+        "timestamp": (base_time + timedelta(days=195, hours=7)).isoformat(),
+        "service": "inventory-worker",
+        "severity": "SEV-2",
+        "title": "Bad deploy release v4.0.1 infinite loop consuming worker CPU",
+        "logs": [
+            "[2024-05-15T08:30:00Z] [inventory-worker] INFO [192.0.2.30] Completed deployment of inventory-worker v4.0.1",
+            "[2024-05-15T08:32:00Z] [inventory-worker] WARN [192.0.2.30] CPU utilization on all worker nodes hit 100%",
+            "[2024-05-15T08:33:00Z] [inventory-worker] ERROR [192.0.2.32] Worker task lock timeout after 30000ms",
+            "[2024-05-15T08:34:00Z] [inventory-worker] ERROR [192.0.2.32] RecursionError: maximum recursion depth exceeded in while-loop sync_inventory_state()",
+            "[2024-05-15T08:35:00Z] [inventory-worker] ERROR [192.0.2.35] Celery task queue backlog growing exponentially: 45,000 tasks pending",
+            "[2024-05-15T08:36:00Z] [inventory-worker] CRITICAL [192.0.2.35] Node worker process unresponsive, health check failed",
+            "[2024-05-15T08:37:00Z] [inventory-worker] WARN [192.0.2.35] OOMKilled signal sent to inventory worker processes",
+            "[2024-05-15T08:38:00Z] [inventory-worker] ERROR [192.0.2.35] Sync job failure rate 100%"
+        ],
+        "root_cause": "Bad deploy v4.0.1 introduced a regression in sync_inventory_state() where loop exit condition was never met when stock count was 0.",
+        "failed_first_step": "Restarting worker pods (failed because new pods immediately resumed processing the stuck queue and hit 100% CPU again).",
+        "resolution_steps": [
+            "Roll back inventory-worker image tag to v4.0.0.",
+            "Purge stuck tasks from Celery queue using celery purge."
+        ],
+        "runbook_used": "runbook-deploy-rollback.md",
+        "time_to_resolve": "25 minutes"
+    })
+
+    incidents.append({
+        "id": "INC-114",
+        "timestamp": (base_time + timedelta(days=210, hours=19)).isoformat(),
+        "service": "orders-db",
+        "severity": "SEV-1",
+        "title": "Bad deploy database migration v114 locked main orders table",
+        "logs": [
+            "[2024-05-30T21:00:00Z] [orders-db] INFO [192.0.2.40] Executing database migration 114_add_tracking_number_index.sql",
+            "[2024-05-30T21:01:00Z] [orders-db] WARN [192.0.2.40] ALTER TABLE orders ADD INDEX tracking_num_idx (tracking_number) holding ACCESS EXCLUSIVE lock",
+            "[2024-05-30T21:02:00Z] [orders-db] ERROR [192.0.2.42] All write queries on orders table blocked waiting for relation lock",
+            "[2024-05-30T21:03:00Z] [orders-db] ERROR [192.0.2.42] Lock timeout exceeded on 450 client HTTP threads across API services",
+            "[2024-05-30T21:04:00Z] [orders-db] CRITICAL [192.0.2.45] Cascading failure across checkout-api, payments-svc, and orders-db",
+            "[2024-05-30T21:05:00Z] [orders-db] ERROR [192.0.2.45] Statement cancelled due to lock timeout",
+            "[2024-05-30T21:06:00Z] [orders-db] WARN [192.0.2.45] Database replication lag spiking to 120s",
+            "[2024-05-30T21:07:00Z] [orders-db] ERROR [192.0.2.45] Orders creation completely down"
+        ],
+        "root_cause": "Bad deploy migration ran CREATE INDEX without CONCURRENTLY keyword, taking an ACCESS EXCLUSIVE lock on the 50GB orders table during peak hours.",
+        "failed_first_step": None,
+        "resolution_steps": [
+            "Cancel active migration query pid using pg_cancel_backend(pid) to release table lock.",
+            "Re-run migration using CREATE INDEX CONCURRENTLY during off-peak window."
+        ],
+        "runbook_used": "runbook-db-migration.md",
+        "time_to_resolve": "16 minutes"
+    })
+
+    # LOOK-ALIKE INCIDENT 3 (Symptom looks like DB pool exhaustion, but root cause was Bad Deploy setting zero timeout)
+    incidents.append({
+        "id": "INC-115",
+        "timestamp": (base_time + timedelta(days=225, hours=12)).isoformat(),
+        "service": "payments-svc",
+        "severity": "SEV-1",
+        "title": "Payments service latency surge resembling DB pool exhaustion after v2.2.0 deploy",
+        "logs": [
+            "[2024-06-14T13:00:00Z] [payments-svc] INFO [192.0.2.50] Release v2.2.0 deployed to payments-svc",
+            "[2024-06-14T13:03:00Z] [payments-svc] WARN [192.0.2.50] Active requests per pod maxed out, pool queue backing up",
+            "[2024-06-14T13:04:15Z] [payments-svc] ERROR [192.0.2.52] TimeoutError: QueuePool limit of size 50 overflow 10 reached",
+            "[2024-06-14T13:05:00Z] [payments-svc] ERROR [192.0.2.52] Connection pool exhausted in payments-svc",
+            "[2024-06-14T13:06:00Z] [payments-svc] CRITICAL [192.0.2.55] Payment processing latencies p99 > 60000ms",
+            "[2024-06-14T13:07:00Z] [payments-svc] ERROR [192.0.2.55] HTTP 504 Gateway Timeout across payments endpoints",
+            "[2024-06-14T13:08:00Z] [payments-svc] WARN [192.0.2.55] Downstream HTTP client connection timeout set to 0 (infinite)",
+            "[2024-06-14T13:09:00Z] [payments-svc] ERROR [192.0.2.55] Thread exhaustion in payments HTTP worker pool"
+        ],
+        "root_cause": "Look-alike incident: Initial alert reported DB pool exhaustion, but root cause was Bad Deploy v2.2.0 which set the HTTP client default timeout to 0 (infinite), hanging worker threads indefinitely on dropped outbound connections.",
+        "failed_first_step": "Increasing database connection pool size from 50 to 200 (did not resolve latency because worker threads were hung on infinite HTTP socket reads).",
+        "resolution_steps": [
+            "Roll back payments-svc release to v2.1.9.",
+            "Verify default HTTP client timeout is restored to 5.0 seconds."
+        ],
+        "runbook_used": "runbook-deploy-rollback.md",
+        "time_to_resolve": "20 minutes"
+    })
+
+    # Incident 16..20: Expired certificates
+    incidents.append({
+        "id": "INC-116",
+        "timestamp": (base_time + timedelta(days=240, hours=2)).isoformat(),
+        "service": "auth-gateway",
+        "severity": "SEV-1",
+        "title": "TLS Certificate Expired on auth-gateway ingress endpoint",
+        "logs": [
+            "[2024-06-29T02:00:01Z] [auth-gateway] INFO [203.0.113.60] Incoming client TLS handshake initiated",
+            "[2024-06-29T02:00:02Z] [auth-gateway] ERROR [203.0.113.60] SSLError: [SSL: CERTIFICATE_VERIFY_FAILED] certificate has expired (_ssl.c:1129)",
+            "[2024-06-29T02:00:05Z] [auth-gateway] ERROR [203.0.113.62] Handshake failure: Certificate expired at 2024-06-29 02:00:00 UTC",
+            "[2024-06-29T02:00:10Z] [auth-gateway] ERROR [203.0.113.62] Client HTTPS connection rejected for domain auth.internal.company.com",
+            "[2024-06-29T02:00:15Z] [auth-gateway] CRITICAL [203.0.113.65] Ingress controller cert-manager failed to auto-renew cert auth-tls-secret",
+            "[2024-06-29T02:00:20Z] [auth-gateway] ERROR [203.0.113.65] 100% of external API auth requests failing with SSL error",
+            "[2024-06-29T02:00:25Z] [auth-gateway] WARN [203.0.113.65] Let's Encrypt ACME challenge DNS validation timed out",
+            "[2024-06-29T02:00:30Z] [auth-gateway] ERROR [203.0.113.65] SSL handshake error rate: 100%"
+        ],
+        "root_cause": "TLS certificate auth.internal.company.com expired because cert-manager service account lost DNS-01 challenge credentials during IAM role cleanup.",
+        "failed_first_step": "Restarting ingress-nginx controller pods (did not help because ingress was still serving the expired cert secret).",
+        "resolution_steps": [
+            "Fix cert-manager IAM role DNS policy permissions.",
+            "Manually trigger cert-manager renewal with kubectl cert-manager renew auth-tls-secret.",
+            "Reload ingress controller configuration."
+        ],
+        "runbook_used": "runbook-tls-cert-expiry.md",
+        "time_to_resolve": "25 minutes"
+    })
+
+    incidents.append({
+        "id": "INC-117",
+        "timestamp": (base_time + timedelta(days=255, hours=15)).isoformat(),
+        "service": "payments-svc",
+        "severity": "SEV-1",
+        "title": "mTLS Certificate Expired between Payments Svc and Banking Gateway",
+        "logs": [
+            "[2024-07-14T15:30:00Z] [payments-svc] INFO [203.0.113.70] Initiating mTLS connection to bank-gateway.partner.net:8443",
+            "[2024-07-14T15:30:02Z] [payments-svc] ERROR [203.0.113.70] httpx.ConnectError: [SSL: CERTIFICATE_VERIFY_FAILED] certificate expired",
+            "[2024-07-14T15:30:05Z] [payments-svc] ERROR [203.0.113.72] Client client_cert_2023.pem invalid: NotAfter date was 2024-07-14 15:00:00",
+            "[2024-07-14T15:30:10Z] [payments-svc] ERROR [203.0.113.72] Payment settlement payload rejected during mTLS handshake",
+            "[2024-07-14T15:30:15Z] [payments-svc] CRITICAL [203.0.113.75] Bank settlement pipeline halted",
+            "[2024-07-14T15:30:20Z] [payments-svc] WARN [203.0.113.75] Retrying mTLS connection with exponential backoff...",
+            "[2024-07-14T15:30:25Z] [payments-svc] ERROR [203.0.113.75] SSLError: Certificate expired",
+            "[2024-07-14T15:30:30Z] [payments-svc] ERROR [203.0.113.75] 100% payments settlement failure"
+        ],
+        "root_cause": "Internal client mTLS certificate used for banking gateway authentication expired after 1 year without automated rotation alert.",
+        "failed_first_step": None,
+        "resolution_steps": [
+            "Generate new client mTLS keypair using internal CA Vault.",
+            "Update payments-svc Kubernetes Secret bank-mtls-cert with new cert and key.",
+            "Perform rolling restart of payments-svc pods."
+        ],
+        "runbook_used": "runbook-tls-cert-expiry.md",
+        "time_to_resolve": "30 minutes"
+    })
+
+    incidents.append({
+        "id": "INC-118",
+        "timestamp": (base_time + timedelta(days=270, hours=11)).isoformat(),
+        "service": "checkout-api",
+        "severity": "SEV-2",
+        "title": "Internal CA root cert expiry breaking HTTPS calls from checkout-api to auth-gateway",
+        "logs": [
+            "[2024-07-29T11:00:00Z] [checkout-api] INFO [203.0.113.80] Calling https://auth-gateway.internal/verify",
+            "[2024-07-29T11:00:02Z] [checkout-api] ERROR [203.0.113.80] urllib3.exceptions.SSLError: [SSL: CERTIFICATE_VERIFY_FAILED] self-signed certificate in certificate chain",
+            "[2024-07-29T11:00:05Z] [checkout-api] ERROR [203.0.113.82] Internal root CA 'Company-Internal-Root-CA-2019' expired at 2024-07-29T10:59:59Z",
+            "[2024-07-29T11:00:10Z] [checkout-api] ERROR [203.0.113.82] Failed to verify internal service token",
+            "[2024-07-29T11:00:15Z] [checkout-api] CRITICAL [203.0.113.85] Internal service-to-service RPC calls failing across cluster",
+            "[2024-07-29T11:00:20Z] [checkout-api] WARN [203.0.113.85] Trust store update required",
+            "[2024-07-29T11:00:25Z] [checkout-api] ERROR [203.0.113.85] HTTP 502 Bad Gateway returned from internal RPC proxy",
+            "[2024-07-29T11:00:30Z] [checkout-api] ERROR [203.0.113.85] Checkout verification failed"
+        ],
+        "root_cause": "Internal Root CA certificate expired, invalidating all downstream service certificates signed by internal CA.",
+        "failed_first_step": "Setting verify=False in checkout-api client code (failed code review and security automated deployment blocker).",
+        "resolution_steps": [
+            "Distribute updated Internal-Root-CA-2024 bundle into base docker image trust store /etc/ssl/certs.",
+            "Issue new leaf certs signed by 2024 Root CA and redeploy auth-gateway."
+        ],
+        "runbook_used": "runbook-tls-cert-expiry.md",
+        "time_to_resolve": "45 minutes"
+    })
+
+    incidents.append({
+        "id": "INC-119",
+        "timestamp": (base_time + timedelta(days=285, hours=8)).isoformat(),
+        "service": "search-indexer",
+        "severity": "SEV-2",
+        "title": "Expired SSL certificate on Elasticsearch cluster endpoint",
+        "logs": [
+            "[2024-08-13T08:15:00Z] [search-indexer] INFO [203.0.113.90] Connecting to https://es-cluster.internal:9200",
+            "[2024-08-13T08:15:03Z] [search-indexer] ERROR [203.0.113.90] elasticsearch.exceptions.SSLError: TransportError(N/A, '[SSL: CERTIFICATE_VERIFY_FAILED] certificate has expired')",
+            "[2024-08-13T08:15:08Z] [search-indexer] ERROR [203.0.113.92] Node es-node-01 SSL cert expired on 2024-08-13",
+            "[2024-08-13T08:15:12Z] [search-indexer] ERROR [203.0.113.92] Bulk index batch failed: SSL handshake exception",
+            "[2024-08-13T08:15:18Z] [search-indexer] CRITICAL [203.0.113.95] Search indexer pipeline backlogged",
+            "[2024-08-13T08:15:22Z] [search-indexer] WARN [203.0.113.95] Indexer worker retrying connection in 30s...",
+            "[2024-08-13T08:15:28Z] [search-indexer] ERROR [203.0.113.95] TransportError 503",
+            "[2024-08-13T08:15:35Z] [search-indexer] ERROR [203.0.113.95] Failed to index product updates"
+        ],
+        "root_cause": "Elasticsearch cluster node HTTP interface certificate expired.",
+        "failed_first_step": None,
+        "resolution_steps": [
+            "Rotate node certificates on Elasticsearch cluster nodes using elasticsearch-certutil.",
+            "Perform rolling restart of Elasticsearch nodes and search-indexer pods."
+        ],
+        "runbook_used": "runbook-tls-cert-expiry.md",
+        "time_to_resolve": "20 minutes"
+    })
+
+    incidents.append({
+        "id": "INC-120",
+        "timestamp": (base_time + timedelta(days=300, hours=20)).isoformat(),
+        "service": "inventory-worker",
+        "severity": "SEV-3",
+        "title": "Expired SSL certificate on legacy supplier API webhook listener",
+        "logs": [
+            "[2024-08-28T20:00:00Z] [inventory-worker] INFO [203.0.113.99] Supplier webhook listener starting TLS handshake",
+            "[2024-08-28T20:00:02Z] [inventory-worker] ERROR [203.0.113.99] SSLHandshakeException: Certificate expired at 2024-08-28 19:59:59",
+            "[2024-08-28T20:00:05Z] [inventory-worker] ERROR [203.0.113.99] Unable to receive inventory updates from supplier partner",
+            "[2024-08-28T20:00:10Z] [inventory-worker] WARN [203.0.113.99] Webhook delivery retries failing: 100% failure rate",
+            "[2024-08-28T20:00:15Z] [inventory-worker] ERROR [203.0.113.99] SSL_ERROR_EXPIRED_CERTIFICATE",
+            "[2024-08-28T20:00:20Z] [inventory-worker] CRITICAL [203.0.113.99] Supplier stock synchronization stalled",
+            "[2024-08-28T20:00:25Z] [inventory-worker] WARN [203.0.113.99] Alert triggered: Supplier cert expiry",
+            "[2024-08-28T20:00:30Z] [inventory-worker] ERROR [203.0.113.99] Ingress TLS termination error"
+        ],
+        "root_cause": "Ingress certificate for supplier-webhook.company.com expired.",
+        "failed_first_step": None,
+        "resolution_steps": [
+            "Renew ingress TLS certificate using cert-manager.",
+            "Re-trigger missed supplier webhooks."
+        ],
+        "runbook_used": "runbook-tls-cert-expiry.md",
+        "time_to_resolve": "15 minutes"
+    })
+
+    # Incident 21..25: Memory leaks
+    incidents.append({
+        "id": "INC-121",
+        "timestamp": (base_time + timedelta(days=315, hours=14)).isoformat(),
+        "service": "checkout-api",
+        "severity": "SEV-1",
+        "title": "Gradual memory leak in checkout-api causing container OOMKilled crashes",
+        "logs": [
+            "[2024-09-12T14:00:00Z] [checkout-api] INFO [198.51.100.110] Pod checkout-api-5c4d-99a memory usage: 1.2GB / 2.0GB (60%)",
+            "[2024-09-12T14:15:00Z] [checkout-api] WARN [198.51.100.110] Pod checkout-api-5c4d-99a memory usage: 1.7GB / 2.0GB (85%)",
+            "[2024-09-12T14:25:00Z] [checkout-api] WARN [198.51.100.110] Pod checkout-api-5c4d-99a memory usage: 1.95GB / 2.0GB (97%)",
+            "[2024-09-12T14:28:10Z] [checkout-api] ERROR [198.51.100.110] Kernel: Out of memory: Kill process 14201 (python) score 980 or sacrifice child",
+            "[2024-09-12T14:28:12Z] [checkout-api] CRITICAL [198.51.100.110] Container checkout-api terminated with exit code 137 (OOMKilled)",
+            "[2024-09-12T14:29:00Z] [checkout-api] ERROR [198.51.100.112] HTTP 502 Bad Gateway returned while pod restarts",
+            "[2024-09-12T14:30:00Z] [checkout-api] WARN [198.51.100.112] Rolling restart cycling across all pods every 30 minutes",
+            "[2024-09-12T14:31:00Z] [checkout-api] ERROR [198.51.100.112] Unhandled global cache array accumulation"
+        ],
+        "root_cause": "A global in-memory request tracking array `_request_history` was appended to on every HTTP request without cleanup, causing memory to grow linearly until OOMKilled.",
+        "failed_first_step": "Increasing Kubernetes container memory limit from 2GB to 4GB (failed because it only delayed OOMKilled crash by 30 minutes).",
+        "resolution_steps": [
+            "Remove global array accumulation in telemetry middle-ware.",
+            "Deploy patched release v3.2.1."
+        ],
+        "runbook_used": "runbook-memory-leak.md",
+        "time_to_resolve": "35 minutes"
+    })
+
+    incidents.append({
+        "id": "INC-122",
+        "timestamp": (base_time + timedelta(days=330, hours=9)).isoformat(),
+        "service": "search-indexer",
+        "severity": "SEV-2",
+        "title": "Memory leak in search indexer PDF parsing worker",
+        "logs": [
+            "[2024-09-27T09:10:00Z] [search-indexer] INFO [198.51.100.120] Worker process 442 started parsing PDF batch",
+            "[2024-09-27T09:20:00Z] [search-indexer] WARN [198.51.100.120] Worker resident set size (RSS): 3.4GB / 4.0GB",
+            "[2024-09-27T09:28:00Z] [search-indexer] ERROR [198.51.100.120] MemoryError: Failed to allocate 128MB buffer",
+            "[2024-09-27T09:28:30Z] [search-indexer] CRITICAL [198.51.100.120] Systemd cgroup memory limit reached: OOMKilled worker process",
+            "[2024-09-27T09:29:00Z] [search-indexer] ERROR [198.51.100.122] Indexing pipeline worker crashed unexpectedly",
+            "[2024-09-27T09:30:00Z] [search-indexer] WARN [198.51.100.122] Re-spawning worker process...",
+            "[2024-09-27T09:31:00Z] [search-indexer] ERROR [198.51.100.122] Un-freed C-bindings memory buffer in pdfminer library",
+            "[2024-09-27T09:32:00Z] [search-indexer] ERROR [198.51.100.122] Batch processing stalled"
+        ],
+        "root_cause": "Underlying C-extension in PDF parsing library leaked document object handles on corrupt PDF input files.",
+        "failed_first_step": None,
+        "resolution_steps": [
+            "Isolate PDF parsing into spawned subprocesses that terminate after processing each file batch.",
+            "Upgrade pdfminer C-extension package to v20240801."
+        ],
+        "runbook_used": "runbook-memory-leak.md",
+        "time_to_resolve": "25 minutes"
+    })
+
+    incidents.append({
+        "id": "INC-123",
+        "timestamp": (base_time + timedelta(days=345, hours=17)).isoformat(),
+        "service": "auth-gateway",
+        "severity": "SEV-2",
+        "title": "Auth Gateway memory leak in JWT verification key cache",
+        "logs": [
+            "[2024-10-12T17:00:00Z] [auth-gateway] INFO [198.51.100.130] Auth Gateway process uptime: 14 days",
+            "[2024-10-12T17:10:00Z] [auth-gateway] WARN [198.51.100.130] Heap memory usage 92%: 1.84GB / 2.0GB",
+            "[2024-10-12T17:18:00Z] [auth-gateway] ERROR [198.51.100.130] java.lang.OutOfMemoryError: Java heap space",
+            "[2024-10-12T17:18:20Z] [auth-gateway] CRITICAL [198.51.100.130] JVM crash dump created: java_pid881.hprof",
+            "[2024-10-12T17:19:00Z] [auth-gateway] ERROR [198.51.100.132] Auth pod restart loop initiated by Kubernetes liveness probe",
+            "[2024-10-12T17:20:00Z] [auth-gateway] WARN [198.51.100.132] Authentication latency elevated during pod restarts",
+            "[2024-09-12T17:21:00Z] [auth-gateway] ERROR [198.51.100.132] JWK key cache HashMap growing infinitely without eviction",
+            "[2024-10-12T17:22:00Z] [auth-gateway] ERROR [198.51.100.132] Auth failures spiking"
+        ],
+        "root_cause": "JWK verification public keys were cached in an unbound HashMap without maximum size or TTL eviction.",
+        "failed_first_step": "Increasing JVM heap size -Xmx2g to -Xmx4g (delaying crash but not fixing memory leak).",
+        "resolution_steps": [
+            "Replace unbound HashMap with Guava Cache / LRUCache with max 1000 entries and 1 hour expiration.",
+            "Deploy auth-gateway v1.8.4."
+        ],
+        "runbook_used": "runbook-memory-leak.md",
+        "time_to_resolve": "28 minutes"
+    })
+
+    incidents.append({
+        "id": "INC-124",
+        "timestamp": (base_time + timedelta(days=360, hours=4)).isoformat(),
+        "service": "inventory-worker",
+        "severity": "SEV-2",
+        "title": "Inventory Worker memory leak in image resizing library",
+        "logs": [
+            "[2024-10-27T04:00:00Z] [inventory-worker] INFO [198.51.100.140] Processing product catalog image thumbnail generation",
+            "[2024-10-27T04:15:00Z] [inventory-worker] WARN [198.51.100.140] Memory usage elevated: 3.1GB / 4.0GB",
+            "[2024-10-27T04:22:00Z] [inventory-worker] ERROR [198.51.100.140] Out of Memory: Kill process worker-21",
+            "[2024-10-27T04:22:15Z] [inventory-worker] CRITICAL [198.51.100.140] Worker pod evicted due to memory pressure",
+            "[2024-10-27T04:23:00Z] [inventory-worker] ERROR [198.51.100.142] Pillow Image.open() holding raw bitmap buffer references in memory",
+            "[2024-10-27T04:24:00Z] [inventory-worker] WARN [198.51.100.142] Image processing backlog accumulating",
+            "[2024-10-27T04:25:00Z] [inventory-worker] ERROR [198.51.100.142] Failed image processing tasks: 1200",
+            "[2024-10-27T04:26:00Z] [inventory-worker] ERROR [198.51.100.142] OOMKilled worker process"
+        ],
+        "root_cause": "Pillow Image instances were assigned to a module-level cache dictionary without image.close() calls.",
+        "failed_first_step": None,
+        "resolution_steps": [
+            "Use context manager `with Image.open(...) as img:` to guarantee bitmap buffers are closed immediately.",
+            "Deploy hotfix v4.0.3."
+        ],
+        "runbook_used": "runbook-memory-leak.md",
+        "time_to_resolve": "18 minutes"
+    })
+
+    incidents.append({
+        "id": "INC-125",
+        "timestamp": (base_time + timedelta(days=375, hours=11)).isoformat(),
+        "service": "payments-svc",
+        "severity": "SEV-1",
+        "title": "Payments service memory leak in transaction audit log logger",
+        "logs": [
+            "[2024-11-11T11:00:00Z] [payments-svc] INFO [198.51.100.150] Payments service processing batch",
+            "[2024-11-11T11:20:00Z] [payments-svc] WARN [198.51.100.150] Pod RAM usage: 91% (3.64GB / 4.0GB)",
+            "[2024-11-11T11:30:00Z] [payments-svc] ERROR [198.51.100.150] Command terminated by signal 9 (SIGKILL)",
+            "[2024-11-11T11:30:15Z] [payments-svc] CRITICAL [198.51.100.150] Container payments-svc OOMKilled by Kubernetes node engine",
+            "[2024-11-11T11:31:00Z] [payments-svc] ERROR [198.51.100.152] In-memory log appender queue buffered 2 million un-flushed log entries",
+            "[2024-11-11T11:32:00Z] [payments-svc] WARN [198.51.100.152] Payment transaction processing dropped during pod restart",
+            "[2024-11-11T11:33:00Z] [payments-svc] ERROR [198.51.100.152] OOM crash loop every 45 minutes",
+            "[2024-11-11T11:34:00Z] [payments-svc] ERROR [198.51.100.152] Payment API returning 500 error"
+        ],
+        "root_cause": "Async log handler used an unbounded in-memory ring buffer for audit logs when remote log collector was slow.",
+        "failed_first_step": "Restarting payments-svc pods (did not prevent memory growth when logging resumed).",
+        "resolution_steps": [
+            "Configure bounded buffer queue size (max 10,000 logs) with drop-oldest overflow strategy.",
+            "Deploy payments-svc patch release."
+        ],
+        "runbook_used": "runbook-memory-leak.md",
+        "time_to_resolve": "22 minutes"
+    })
+
+    # Incident 26..30: Disk-full / log-volume
+    incidents.append({
+        "id": "INC-126",
+        "timestamp": (base_time + timedelta(days=390, hours=3)).isoformat(),
+        "service": "orders-db",
+        "severity": "SEV-1",
+        "title": "Disk Full on orders-db primary node due to un-rotated PostgreSQL WAL logs",
+        "logs": [
+            "[2024-11-26T03:00:00Z] [orders-db] INFO [203.0.113.200] Storage volume /var/lib/postgresql/data usage: 94%",
+            "[2024-11-26T03:10:00Z] [orders-db] WARN [203.0.113.200] Storage volume /var/lib/postgresql/data usage: 99.8%",
+            "[2024-11-26T03:14:02Z] [orders-db] ERROR [203.0.113.200] postgresql[102]: PANIC: could not write to file 'pg_wal/00000001000002F40000008E': No space left on device",
+            "[2024-11-26T03:14:05Z] [orders-db] CRITICAL [203.0.113.200] PostgreSQL engine shutdown unexpectedly: Disk full (100% used)",
+            "[2024-11-26T03:15:00Z] [orders-db] ERROR [203.0.113.202] Database primary node in READ-ONLY emergency crash state",
+            "[2024-11-26T03:16:00Z] [orders-db] ERROR [203.0.113.202] All application write operations failing across entire platform",
+            "[2024-11-26T03:17:00Z] [orders-db] WARN [203.0.113.202] Archiving script wal-g failed due to expired S3 credentials",
+            "[2024-11-26T03:18:00Z] [orders-db] ERROR [203.0.113.202] Disk space exhausted: 0 bytes free"
+        ],
+        "root_cause": "WAL archive script failed due to expired S3 backup credentials, causing PostgreSQL to retain WAL files locally until root disk filled 100%.",
+        "failed_first_step": "Deleting PostgreSQL WAL files manually with 'rm -rf pg_wal/*' (failed because manual deletion corrupted database WAL sequence and required restore).",
+        "resolution_steps": [
+            "Update S3 backup credentials and safely archive old WAL logs using pg_archivebackup.",
+            "Expand EBS persistent volume size from 500GB to 1000GB.",
+            "Restart PostgreSQL primary node."
+        ],
+        "runbook_used": "runbook-disk-full.md",
+        "time_to_resolve": "55 minutes"
+    })
+
+    incidents.append({
+        "id": "INC-127",
+        "timestamp": (base_time + timedelta(days=405, hours=13)).isoformat(),
+        "service": "checkout-api",
+        "severity": "SEV-2",
+        "title": "Disk Full on checkout-api node due to debug stdout logging volume",
+        "logs": [
+            "[2024-12-11T13:00:00Z] [checkout-api] INFO [203.0.113.210] System volume /var/log usage 92%",
+            "[2024-12-11T13:15:00Z] [checkout-api] WARN [203.0.113.210] System volume /var/log usage 99.9%",
+            "[2024-12-11T13:20:00Z] [checkout-api] ERROR [203.0.113.210] IO Error: [Errno 28] No space left on device while writing to /var/log/checkout-api/app.log",
+            "[2024-12-11T13:21:00Z] [checkout-api] CRITICAL [203.0.113.210] Pod disk full, Docker daemon unable to write container logs",
+            "[2024-12-11T13:22:00Z] [checkout-api] ERROR [203.0.113.212] Pod status evicted: DiskPressure",
+            "[2024-12-11T13:23:00Z] [checkout-api] WARN [203.0.113.212] Node checkout-node-03 pressure alert: Disk lower than 100MB",
+            "[2024-12-11T13:24:00Z] [checkout-api] ERROR [203.0.113.212] Checkout API pod eviction loop",
+            "[2024-12-11T13:25:00Z] [checkout-api] ERROR [203.0.113.212] App log file reached 120GB"
+        ],
+        "root_cause": "DEBUG logging level was accidentally left enabled in production, generating 50GB of log files per hour and filling the node root partition.",
+        "failed_first_step": None,
+        "resolution_steps": [
+            "Change log level env variable LOG_LEVEL from DEBUG to INFO in Helm config.",
+            "Truncate large log files using `truncate -s 0 /var/log/checkout-api/*.log` and configure logrotate."
+        ],
+        "runbook_used": "runbook-disk-full.md",
+        "time_to_resolve": "18 minutes"
+    })
+
+    incidents.append({
+        "id": "INC-128",
+        "timestamp": (base_time + timedelta(days=415, hours=8)).isoformat(),
+        "service": "search-indexer",
+        "severity": "SEV-2",
+        "title": "Disk Full on search-indexer node due to temporary indexing dump files",
+        "logs": [
+            "[2024-12-21T08:00:00Z] [search-indexer] INFO [203.0.113.220] Batch indexing job dumping temp files to /tmp/indexing",
+            "[2024-12-21T08:20:00Z] [search-indexer] WARN [203.0.113.220] Partition /tmp reaching capacity: 96% used",
+            "[2024-12-21T08:28:00Z] [search-indexer] ERROR [203.0.113.220] OSError: [Errno 28] No space left on device: '/tmp/indexing/chunk_99.tmp'",
+            "[2024-12-21T08:29:00Z] [search-indexer] CRITICAL [203.0.113.220] Search index rebuild job failed on disk full",
+            "[2024-12-21T08:30:00Z] [search-indexer] ERROR [203.0.113.222] Unable to write temporary index shard",
+            "[2024-12-21T08:31:00Z] [search-indexer] WARN [203.0.113.222] Temp files accumulating from crashed previous runs",
+            "[2024-12-21T08:32:00Z] [search-indexer] ERROR [203.0.113.222] Search service updates halted",
+            "[2024-12-21T08:33:00Z] [search-indexer] ERROR [203.0.113.222] Disk full error on temporary folder"
+        ],
+        "root_cause": "Temp folder /tmp/indexing accumulated orphan temporary chunk files from failed indexing attempts without cleanup cron.",
+        "failed_first_step": "Increasing pod ephemeral-storage limits without clearing existing files (disk stayed 100% full).",
+        "resolution_steps": [
+            "Clean up orphan files with `rm -rf /tmp/indexing/*.tmp`.",
+            "Add automatic tempfile cleanup in indexer code using tempfile.TemporaryDirectory()."
+        ],
+        "runbook_used": "runbook-disk-full.md",
+        "time_to_resolve": "15 minutes"
+    })
+
+    incidents.append({
+        "id": "INC-129",
+        "timestamp": (base_time + timedelta(days=422, hours=16)).isoformat(),
+        "service": "auth-gateway",
+        "severity": "SEV-2",
+        "title": "Disk Full on auth-gateway pods caused by core dump generation",
+        "logs": [
+            "[2024-12-28T16:00:00Z] [auth-gateway] INFO [203.0.113.230] Auth Gateway worker process segment fault",
+            "[2024-12-28T16:02:00Z] [auth-gateway] WARN [203.0.113.230] Core dump created: /var/cores/core.8821 (15GB)",
+            "[2024-12-28T16:05:00Z] [auth-gateway] ERROR [203.0.113.230] Storage partition /var/cores 100% full",
+            "[2024-12-28T16:06:00Z] [auth-gateway] CRITICAL [203.0.113.230] Node disk pressure eviction initiated",
+            "[2024-12-28T16:07:00Z] [auth-gateway] ERROR [203.0.113.232] Auth Gateway unable to write session logs",
+            "[2024-12-28T16:08:00Z] [auth-gateway] WARN [203.0.113.232] Multiple auth pods crashing simultaneously",
+            "[2024-12-28T16:09:00Z] [auth-gateway] ERROR [203.0.113.232] No space left on device",
+            "[2024-12-28T16:10:00Z] [auth-gateway] ERROR [203.0.113.232] Gateway operational failure"
+        ],
+        "root_cause": "Repeated worker segmentation faults generated multiple 15GB core dump files, filling up container disk storage.",
+        "failed_first_step": None,
+        "resolution_steps": [
+            "Delete core dump files from `/var/cores/`.",
+            "Disable core dump generation in Kubernetes security Context (`ulimit -c 0`)."
+        ],
+        "runbook_used": "runbook-disk-full.md",
+        "time_to_resolve": "20 minutes"
+    })
+
+    incidents.append({
+        "id": "INC-130",
+        "timestamp": (base_time + timedelta(days=428, hours=22)).isoformat(),
+        "service": "inventory-worker",
+        "severity": "SEV-3",
+        "title": "Disk Full on inventory-worker storage volume due to uncompressed audit log archives",
+        "logs": [
+            "[2025-01-03T22:00:00Z] [inventory-worker] INFO [203.0.113.240] Archiving monthly inventory updates",
+            "[2025-01-03T22:15:00Z] [inventory-worker] WARN [203.0.113.240] Storage volume /data/archives usage 98%",
+            "[2025-01-03T22:20:00Z] [inventory-worker] ERROR [203.0.113.240] IOError: [Errno 28] No space left on device: '/data/archives/inv_2024_12.json'",
+            "[2025-01-03T22:21:00Z] [inventory-worker] CRITICAL [203.0.113.240] Inventory audit task failed",
+            "[2025-01-03T22:22:00Z] [inventory-worker] ERROR [203.0.113.242] Disk full on volume /data/archives",
+            "[2025-01-03T22:23:00Z] [inventory-worker] WARN [203.0.113.242] Uncompressed JSON archive files taking 80GB space",
+            "[2025-01-03T22:24:00Z] [inventory-worker] ERROR [203.0.113.242] Sync process stopped",
+            "[2025-01-03T22:25:00Z] [inventory-worker] ERROR [203.0.113.242] Disk usage alert triggered"
+        ],
+        "root_cause": "Monthly inventory audit files were saved as uncompressed JSON instead of gzip compressed files.",
+        "failed_first_step": None,
+        "resolution_steps": [
+            "Gzip all existing JSON archive files (`gzip /data/archives/*.json`), saving 85% disk space.",
+            "Update archiving script to stream outputs directly through gzip compression."
+        ],
+        "runbook_used": "runbook-disk-full.md",
+        "time_to_resolve": "14 minutes"
+    })
+
+    return incidents
+
+if __name__ == "__main__":
+    incidents = generate_incidents()
+    os.makedirs("data", exist_ok=True)
+    with open("data/incidents.json", "w", encoding="utf-8") as f:
+        json.dump(incidents, f, indent=2)
+    print(f"Generated {len(incidents)} incidents in data/incidents.json")
