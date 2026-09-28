@@ -1,6 +1,8 @@
+import asyncio
 import json
 import logging
-from typing import Any, Sequence
+import re
+from typing import Any, Literal, Sequence
 
 from pydantic import BaseModel, Field
 
@@ -9,6 +11,24 @@ from backend.app.llm.client import GroqLLMClient
 from backend.app.memory.protocol import MemoryBackend, RecalledMemory
 
 logger = logging.getLogger(__name__)
+
+
+def tokenize_text(text: str) -> set[str]:
+    """Tokenize and normalize text into word tokens for Jaccard overlap."""
+    clean = re.sub(r"[^\w\s]", " ", text.lower())
+    tokens = {w for w in clean.split() if len(w) > 2}
+    return tokens
+
+
+def jaccard_similarity(text1: str, text2: str) -> float:
+    """Calculate token Jaccard similarity between two strings."""
+    tokens1 = tokenize_text(text1)
+    tokens2 = tokenize_text(text2)
+    if not tokens1 or not tokens2:
+        return 0.0
+    intersection = tokens1.intersection(tokens2)
+    union = tokens1.union(tokens2)
+    return len(intersection) / len(union)
 
 
 class LLMSynthesisSchema(BaseModel):
@@ -37,8 +57,16 @@ class IncidentAgentPipeline:
         if not alert_text_clean:
             return self._build_empty_input_response()
 
+        if not memory_enabled:
+            return await self._synthesize_no_memory_or_generic(
+                alert_text=alert_text_clean,
+                memory_status="off",
+            )
+
+        # Recall with 1 retry on failure
         recalled_memories: list[RecalledMemory] = []
-        if memory_enabled:
+        recall_failed = False
+        for attempt in range(2):
             try:
                 recalled_memories = await self.memory.recall_similar(
                     query=alert_text_clean,
@@ -46,27 +74,34 @@ class IncidentAgentPipeline:
                     max_tokens=4096,
                     prefer_observations=True,
                 )
+                recall_failed = False
+                break
             except Exception as exc:
-                logger.warning(f"Hindsight memory recall failed or timed out: {exc}")
-                # Hindsight timeout/failure -> fall back gracefully without memory crashing
-                recalled_memories = []
+                logger.warning(f"Recall attempt {attempt + 1} failed: {exc}")
+                recall_failed = True
+                if attempt == 0:
+                    await asyncio.sleep(1.0)
 
-        # If memory disabled or recall returned nothing relevant
-        if not memory_enabled or not recalled_memories:
+        if recall_failed:
             return await self._synthesize_no_memory_or_generic(
                 alert_text=alert_text_clean,
-                memory_enabled=memory_enabled,
-                recalled_memories=recalled_memories,
+                memory_status="unavailable",
             )
 
-        # We have recalled memories. Call LLM for synthesis or fall back to degraded memory-only output if LLM fails.
+        if not recalled_memories:
+            return await self._synthesize_no_memory_or_generic(
+                alert_text=alert_text_clean,
+                memory_status="no_match",
+            )
+
+        # Memories found: call LLM or fall back to degraded response
         try:
             return await self._synthesize_with_llm(
                 alert_text=alert_text_clean,
                 recalled_memories=recalled_memories,
             )
         except Exception as exc:
-            logger.error(f"LLM synthesis failed on both primary and fallback models: {exc}")
+            logger.error(f"LLM synthesis failed on primary and fallback models: {exc}")
             return self._build_degraded_memory_response(
                 recalled_memories=recalled_memories,
                 warning=f"LLM synthesis failed ({str(exc)}). Output assembled directly from recalled memories.",
@@ -77,11 +112,10 @@ class IncidentAgentPipeline:
         alert_text: str,
         recalled_memories: Sequence[RecalledMemory],
     ) -> AnalysisOutput:
-        # Build prompt incorporating memories
         memories_formatted = []
         valid_memory_ids = set()
         valid_incident_ids = set()
-        failed_fixes_info = []
+        failed_fixes_info: list[str] = []
 
         for m in recalled_memories:
             valid_memory_ids.add(m.id)
@@ -97,7 +131,7 @@ class IncidentAgentPipeline:
 
             if "FAILED" in m.text or is_failed:
                 failed_fixes_info.append(
-                    f"Memory {m.id} (Incident {m.source_incident_id or 'unknown'}): {m.text}"
+                    f"- Memory ID {m.id} (Incident {m.source_incident_id or 'unknown'}): {m.text}"
                 )
 
             memories_formatted.append(
@@ -108,11 +142,18 @@ class IncidentAgentPipeline:
                 f"  Metadata: {json.dumps(m.metadata)}\n"
             )
 
+        failed_fixes_str = (
+            "\n".join(failed_fixes_info)
+            if failed_fixes_info
+            else "None identified in recalled memories."
+        )
+
         prompt = (
             f"ALERT/LOG RECEIVED:\n{alert_text}\n\n"
             f"RECALLED PAST INCIDENT MEMORIES:\n"
             + "\n".join(memories_formatted)
-            + "\n\nINSTRUCTIONS:\n"
+            + f"\n\nKNOWN FAILED FIX ATTEMPTS IN PAST INCIDENTS:\n{failed_fixes_str}\n\n"
+            "INSTRUCTIONS:\n"
             "Analyze the alert against recalled memories. Identify root cause and resolution steps.\n"
             "Return JSON matching this structure:\n"
             "{\n"
@@ -135,15 +176,19 @@ class IncidentAgentPipeline:
             "2. If a past attempt FAILED in a similar incident, set prior_outcome='failed' and explain why."
         )
 
+        system_prompt = (
+            "You are an incident response agent. Output strictly valid JSON matching the requested schema."
+        )
+
         llm_res = await self.llm_client.generate_structured(
             prompt=prompt,
             response_model=LLMSynthesisSchema,
+            system_prompt=system_prompt,
         )
 
         parsed: LLMSynthesisSchema = llm_res.data
         warnings = list(llm_res.warnings)
 
-        # Grounding check: drop citations not in recalled set
         grounded_rc_sources = [
             sid for sid in parsed.root_cause_sources if sid in valid_incident_ids or sid in valid_memory_ids
         ]
@@ -151,11 +196,27 @@ class IncidentAgentPipeline:
         raw_fix_steps = parsed.proposed_fix_steps
         processed_fix_steps: list[FixStep] = []
 
+        # Build list of failed attempt text fragments from memories
+        failed_texts: list[tuple[str, str]] = []  # (failed_text_fragment, source_incident)
+        for m in recalled_memories:
+            is_failed_mem = (
+                m.metadata.get("result") in ["didnt_work", "failed"]
+                or m.metadata.get("has_failed_step") == "true"
+                or "FAILED" in m.text
+            )
+            if is_failed_mem:
+                failed_inc = m.source_incident_id or "INC-unknown"
+                # Split memory text into lines or sentences containing failure indicators
+                for paragraph in m.text.split(". "):
+                    if "FAILED" in paragraph or "Tried First" in paragraph or "did not work" in paragraph.lower():
+                        failed_texts.append((paragraph, failed_inc))
+                if not failed_texts:
+                    failed_texts.append((m.text, failed_inc))
+
         for idx, step_item in enumerate(raw_fix_steps):
             step_text = str(step_item.get("step", ""))
             rationale = str(step_item.get("rationale", ""))
 
-            # Filter citations
             step_inc_ids = [
                 s for s in step_item.get("source_incident_ids", []) if s in valid_incident_ids
             ]
@@ -167,21 +228,14 @@ class IncidentAgentPipeline:
             if prior_outcome not in ["worked", "failed", "unknown"]:
                 prior_outcome = "unknown"
 
-            # Check if this step was marked as failed in recalled memories
-            for m in recalled_memories:
-                if (
-                    m.metadata.get("result") in ["didnt_work", "failed"]
-                    or "FAILED" in m.text
-                ):
-                    if m.source_incident_id and m.source_incident_id not in step_inc_ids:
-                        pass
-                    # If step text matches a known failed step pattern, mark as failed
-                    if any(
-                        word in step_text.lower()
-                        for word in ["restart", "flushall", "increase", "delete"]
-                    ) and ("failed" in m.text.lower() or m.metadata.get("result") == "didnt_work"):
-                        if m.source_incident_id and m.source_incident_id not in step_inc_ids:
-                            step_inc_ids.append(m.source_incident_id)
+            # Deterministic Jaccard token overlap check against failed attempts
+            for f_text, f_inc in failed_texts:
+                sim = jaccard_similarity(step_text, f_text)
+                if sim >= 0.5:
+                    prior_outcome = "failed"
+                    if f_inc not in step_inc_ids and f_inc != "INC-unknown":
+                        step_inc_ids.append(f_inc)
+                    break
 
             processed_fix_steps.append(
                 FixStep(
@@ -194,9 +248,9 @@ class IncidentAgentPipeline:
                 )
             )
 
-        # Demote failed fix steps to bottom rank & append warning
-        working_steps = []
-        failed_steps = []
+        # Demote failed fix steps to bottom rank
+        working_steps: list[FixStep] = []
+        failed_steps: list[FixStep] = []
 
         for fs in processed_fix_steps:
             if fs.prior_outcome == "failed":
@@ -213,7 +267,6 @@ class IncidentAgentPipeline:
         for r_idx, fs in enumerate(ranked_steps):
             fs.rank = r_idx + 1
 
-        # Memory used payload
         memory_used = [
             {
                 "id": m.id,
@@ -234,6 +287,7 @@ class IncidentAgentPipeline:
             fix_steps=ranked_steps,
             runbooks=parsed.suggested_runbooks,
             memory_used=memory_used,
+            memory_status="ok",
             warnings=warnings,
             model_used=llm_res.model_used,
         )
@@ -241,25 +295,53 @@ class IncidentAgentPipeline:
     async def _synthesize_no_memory_or_generic(
         self,
         alert_text: str,
-        memory_enabled: bool,
-        recalled_memories: Sequence[RecalledMemory],
+        memory_status: Literal["off", "ok", "no_match", "unavailable"],
     ) -> AnalysisOutput:
-        # Prompt LLM for generic troubleshooting without past memory
-        if not memory_enabled:
-            warning_msg = "Memory is OFF. Response generated without historical incident context."
-        else:
-            warning_msg = "No matching historical incidents found in memory."
+        warnings = []
+        if memory_status == "off":
+            recalled_section = "none provided (memory OFF)"
+        elif memory_status == "unavailable":
+            warnings.append("Memory unavailable: answer generated without history")
+            recalled_section = "none provided (memory service unavailable)"
+        else:  # no_match
+            warnings.append("No matching historical incidents found in memory.")
+            recalled_section = "none provided (no matching history found)"
+
+        prompt = (
+            f"ALERT/LOG RECEIVED:\n{alert_text}\n\n"
+            f"RECALLED PAST INCIDENT MEMORIES:\n{recalled_section}\n\n"
+            "INSTRUCTIONS:\n"
+            "Analyze the alert and provide troubleshooting guidance without referencing any specific past incident history or fake citations.\n"
+            "Return JSON matching this structure:\n"
+            "{\n"
+            '  "root_cause_summary": "...",\n'
+            '  "confidence": 0.5,\n'
+            '  "root_cause_sources": [],\n'
+            '  "proposed_fix_steps": [\n'
+            "    {\n"
+            '      "step": "...",\n'
+            '      "rationale": "...",\n'
+            '      "source_incident_ids": [],\n'
+            '      "source_memory_ids": [],\n'
+            '      "prior_outcome": "unknown"\n'
+            "    }\n"
+            "  ],\n"
+            '  "suggested_runbooks": ["runbook-..."]\n'
+            "}\n"
+            "Grounding Rules:\n"
+            "1. ONLY reference source memory IDs and incident IDs present in the recalled list above."
+        )
+
+        system_prompt = (
+            "You are an incident response agent. Output strictly valid JSON matching the requested schema."
+        )
 
         if self.llm_client and self.llm_client.api_key:
             try:
-                prompt = (
-                    f"ALERT/LOG RECEIVED:\n{alert_text}\n\n"
-                    "Analyze this alert and provide generic troubleshooting guidance without referencing any specific past incident history or fake citations.\n"
-                    "Return JSON with root_cause_summary, confidence, proposed_fix_steps, suggested_runbooks."
-                )
                 llm_res = await self.llm_client.generate_structured(
                     prompt=prompt,
                     response_model=LLMSynthesisSchema,
+                    system_prompt=system_prompt,
                 )
                 parsed: LLMSynthesisSchema = llm_res.data
 
@@ -284,7 +366,8 @@ class IncidentAgentPipeline:
                     fix_steps=fix_steps,
                     runbooks=parsed.suggested_runbooks,
                     memory_used=[],
-                    warnings=[warning_msg] + llm_res.warnings,
+                    memory_status=memory_status,
+                    warnings=warnings + llm_res.warnings,
                     model_used=llm_res.model_used,
                 )
             except Exception as exc:
@@ -317,7 +400,8 @@ class IncidentAgentPipeline:
             ],
             runbooks=["runbook-generic-triage.md"],
             memory_used=[],
-            warnings=[warning_msg],
+            memory_status=memory_status,
+            warnings=warnings,
             model_used="generic-offline-fallback",
         )
 
@@ -326,7 +410,6 @@ class IncidentAgentPipeline:
         recalled_memories: Sequence[RecalledMemory],
         warning: str,
     ) -> AnalysisOutput:
-        # Assemble directly from recalled memories when LLM is completely unavailable
         top_mem = recalled_memories[0] if recalled_memories else None
 
         sources = []
@@ -346,7 +429,6 @@ class IncidentAgentPipeline:
             if m.source_incident_id and m.source_incident_id not in sources:
                 sources.append(m.source_incident_id)
 
-            # Extract lines from memory text for steps
             lines = [line.strip() for line in m.text.split("\n") if line.strip()]
             for line in lines:
                 if line.startswith("- ") or "Resolution:" in line or "Fix:" in line:
@@ -374,6 +456,7 @@ class IncidentAgentPipeline:
             fix_steps=fix_steps[:5],
             runbooks=["runbook-degraded-fallback.md"],
             memory_used=memory_used,
+            memory_status="ok",
             warnings=[warning],
             model_used="memory-degraded",
         )
@@ -388,6 +471,7 @@ class IncidentAgentPipeline:
             fix_steps=[],
             runbooks=[],
             memory_used=[],
+            memory_status="off",
             warnings=["Input alert text was empty."],
             model_used="none",
         )

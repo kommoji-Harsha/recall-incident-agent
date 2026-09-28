@@ -1,9 +1,17 @@
 import asyncio
 import os
 import random
+import re
 from typing import Any, Type, TypeVar
 
-from groq import AsyncGroq
+from groq import (
+    APIStatusError,
+    AsyncGroq,
+    AuthenticationError,
+    BadRequestError,
+    NotFoundError,
+    PermissionDeniedError,
+)
 from pydantic import BaseModel
 
 T = TypeVar("T", bound=BaseModel)
@@ -13,6 +21,11 @@ class LLMResult(BaseModel):
     data: Any
     model_used: str
     warnings: list[str] = []
+
+
+def strip_think_blocks(text: str) -> str:
+    """Remove <think>...</think> reasoning blocks from LLM response content."""
+    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
 
 
 class GroqLLMClient:
@@ -52,37 +65,63 @@ class GroqLLMClient:
         for model_idx, model in enumerate(models_to_try):
             for attempt in range(self.max_retries_per_model):
                 try:
-                    # Request JSON mode response
-                    response = await self.client.chat.completions.create(
-                        messages=[
+                    kwargs: dict[str, Any] = {
+                        "messages": [
                             {"role": "system", "content": system_prompt},
                             {"role": "user", "content": prompt},
                         ],
-                        model=model,
-                        temperature=temperature,
-                        response_format={"type": "json_object"},
-                        timeout=self.timeout,
-                    )
+                        "model": model,
+                        "temperature": temperature,
+                        "response_format": {"type": "json_object"},
+                        "timeout": self.timeout,
+                    }
 
-                    content = response.choices[0].message.content or "{}"
+                    # Pass reasoning_format="hidden" for qwen models if supported by groq SDK
+                    if "qwen" in model.lower():
+                        kwargs["reasoning_format"] = "hidden"
+
+                    try:
+                        response = await self.client.chat.completions.create(**kwargs)
+                    except TypeError:
+                        # Fallback if reasoning_format is not accepted by older groq SDK version
+                        kwargs.pop("reasoning_format", None)
+                        response = await self.client.chat.completions.create(**kwargs)
+
+                    raw_content = response.choices[0].message.content or "{}"
+                    clean_content = strip_think_blocks(raw_content)
 
                     # Validate JSON with Pydantic
-                    parsed_data = response_model.model_validate_json(content)
+                    parsed_data = response_model.model_validate_json(clean_content)
                     return LLMResult(data=parsed_data, model_used=model, warnings=warnings)
+
+                except (BadRequestError, AuthenticationError, PermissionDeniedError, NotFoundError) as err:
+                    # Non-retryable status errors: break retry loop and move straight to fallback model
+                    err_str = str(err)
+                    warnings.append(f"Model {model} non-retryable error ({err_str}). Moving to next model.")
+                    break
+
+                except APIStatusError as err:
+                    if err.status_code in [400, 401, 403, 404]:
+                        warnings.append(f"Model {model} non-retryable HTTP {err.status_code}. Moving to next model.")
+                        break
+                    err_str = str(err)
+                    warnings.append(f"Attempt {attempt + 1} on model {model} failed: {err_str}")
+                    if attempt < self.max_retries_per_model - 1:
+                        await asyncio.sleep((2 ** attempt) + random.uniform(0.1, 0.5))
 
                 except Exception as exc:
                     err_str = str(exc)
-                    msg = f"Attempt {attempt + 1} on model {model} failed: {err_str}"
-                    warnings.append(msg)
+                    warnings.append(f"Attempt {attempt + 1} on model {model} failed: {err_str}")
 
-                    # Backoff exponential delay with jitter
                     if attempt < self.max_retries_per_model - 1:
                         sleep_time = (2 ** attempt) + random.uniform(0.1, 0.5)
                         await asyncio.sleep(sleep_time)
 
             if model_idx == 0:
                 warnings.append(
-                    f"Primary model {self.primary_model} exhausted all retries. Falling back to {self.fallback_model}."
+                    f"Primary model {self.primary_model} failed/exhausted. Falling back to {self.fallback_model}."
                 )
 
-        raise RuntimeError(f"Both primary ({self.primary_model}) and fallback ({self.fallback_model}) models failed. Warnings: {warnings}")
+        raise RuntimeError(
+            f"Both primary ({self.primary_model}) and fallback ({self.fallback_model}) models failed. Warnings: {warnings}"
+        )

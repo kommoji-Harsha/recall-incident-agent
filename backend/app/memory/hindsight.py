@@ -1,10 +1,12 @@
-import re
+import logging
 from datetime import datetime
 from typing import Any
 
 from hindsight_client import Hindsight
 
 from backend.app.memory.protocol import MemoryBackend, Observation, RecalledMemory
+
+logger = logging.getLogger(__name__)
 
 
 def derive_source_incident_id(document_id: str | None, metadata: dict[str, Any] | None) -> str | None:
@@ -13,7 +15,8 @@ def derive_source_incident_id(document_id: str | None, metadata: dict[str, Any] 
     if metadata and metadata.get("source_incident_id"):
         return str(metadata["source_incident_id"])
     if document_id:
-        match = re.search(r"INC-\d+", document_id)
+        import re
+        match = re.search(r"INC-\d+", str(document_id))
         if match:
             return match.group(0)
     return None
@@ -36,6 +39,7 @@ class HindsightMemory(MemoryBackend):
             api_key=self.api_key,
             timeout=self.timeout,
         )
+        self.bootstrap_error: str | None = None
 
     async def bootstrap(self) -> None:
         try:
@@ -45,9 +49,28 @@ class HindsightMemory(MemoryBackend):
                 mission="Recall past incident root causes, troubleshooting steps, and resolution outcomes to assist on-call engineers.",
                 disposition={"skepticism": 3, "literalism": 3, "empathy": 1},
             )
-        except Exception:
-            # Bank already exists or API warning; proceed safely
-            pass
+            self.bootstrap_error = None
+        except Exception as exc:
+            err_msg = str(exc)
+            # Ignore ONLY if bank already exists
+            if "already exists" in err_msg.lower() or "409" in err_msg:
+                self.bootstrap_error = None
+            else:
+                logger.error(f"Hindsight bank creation failed: {exc}")
+                self.bootstrap_error = err_msg
+
+    async def ping(self) -> bool:
+        try:
+            await self.client.arecall(
+                bank_id=self.bank_id,
+                query="ping",
+                budget="low",
+                max_tokens=10,
+            )
+            return True
+        except Exception as exc:
+            logger.warning(f"Hindsight ping probe failed: {exc}")
+            return False
 
     async def retain_incident(
         self,
@@ -95,7 +118,7 @@ class HindsightMemory(MemoryBackend):
             document_id=doc_id,
             metadata=meta,
             tags=["outcome", meta.get("result", "")],
-            retain_async=False,  # Outcome retain must be synchronous so next recall sees it immediately
+            retain_async=False,
         )
         return str(res.id if hasattr(res, "id") and res.id else doc_id)
 
@@ -144,34 +167,12 @@ class HindsightMemory(MemoryBackend):
         memories: list[RecalledMemory] = []
         raw_results = getattr(res, "results", []) or []
         for r in raw_results:
-            doc_id = getattr(r, "document_id", None)
-            meta = getattr(r, "metadata", {}) or {}
-            source_inc_id = derive_source_incident_id(doc_id, meta)
-
-            memories.append(
-                RecalledMemory(
-                    id=str(getattr(r, "id", "")),
-                    text=str(getattr(r, "text", "")),
-                    type=str(getattr(r, "type", "world")),
-                    context=getattr(r, "context", None),
-                    metadata=meta,
-                    tags=getattr(r, "tags", []) or [],
-                    entities=getattr(r, "entities", []) or [],
-                    occurred_start=getattr(r, "occurred_start", None),
-                    mentioned_at=getattr(r, "mentioned_at", None),
-                    document_id=doc_id,
-                    chunk_id=getattr(r, "chunk_id", None),
-                    source_fact_ids=getattr(r, "source_fact_ids", []) or [],
-                    scores=getattr(r, "scores", {}) or {},
-                    source_incident_id=source_inc_id,
-                )
-            )
+            memories.append(RecalledMemory.from_sdk(r))
 
         return memories
 
     async def list_observations(self, limit: int = 50) -> list[Observation]:
-        # Fetch observations via recall(types=["observation"], include_source_facts=True)
-        # or alist_memories
+        # Must NOT silently swallow errors: raise on failure
         try:
             res = await self.client.arecall(
                 bank_id=self.bank_id,
@@ -186,44 +187,48 @@ class HindsightMemory(MemoryBackend):
             obs_list: list[Observation] = []
             for r in raw_results:
                 if getattr(r, "type", "") == "observation":
+                    rec = RecalledMemory.from_sdk(r)
                     obs_list.append(
                         Observation(
-                            id=str(getattr(r, "id", "")),
-                            text=str(getattr(r, "text", "")),
-                            context=getattr(r, "context", None),
-                            metadata=getattr(r, "metadata", {}) or {},
-                            tags=getattr(r, "tags", []) or [],
-                            occurred_start=getattr(r, "occurred_start", None),
+                            id=rec.id,
+                            text=rec.text,
+                            context=rec.context,
+                            metadata=rec.metadata,
+                            tags=rec.tags,
+                            occurred_start=rec.occurred_start,
                         )
                     )
             if obs_list:
                 return obs_list[:limit]
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning(f"arecall for observations failed, attempting alist_memories fallback: {exc}")
 
-        # Fallback to alist_memories if available
-        try:
-            mem_res = await self.client.alist_memories(
-                bank_id=self.bank_id,
-                type="observation",
-                limit=limit,
-            )
-            mem_units = getattr(mem_res, "units", []) or []
-            obs_list = []
-            for u in mem_units:
-                obs_list.append(
-                    Observation(
-                        id=str(getattr(u, "id", "")),
-                        text=str(getattr(u, "text", "")),
-                        context=getattr(u, "context", None),
-                        metadata=getattr(u, "metadata", {}) or {},
-                        tags=getattr(u, "tags", []) or [],
-                        occurred_start=getattr(u, "occurred_start", None),
-                    )
+        # Fallback to alist_memories
+        mem_res = await self.client.alist_memories(
+            bank_id=self.bank_id,
+            type="observation",
+            limit=limit,
+        )
+        # Check .items (not .units) as per SDK signature
+        mem_items = getattr(mem_res, "items", None)
+        if mem_items is None:
+            mem_items = getattr(mem_res, "units", []) or []
+
+        obs_list = []
+        for u in mem_items:
+            u_meta = getattr(u, "metadata", {}) or {}
+            meta_clean = {str(k): str(v) for k, v in u_meta.items()}
+            obs_list.append(
+                Observation(
+                    id=str(getattr(u, "id", "")),
+                    text=str(getattr(u, "text", "")),
+                    context=getattr(u, "context", None),
+                    metadata=meta_clean,
+                    tags=getattr(u, "tags", []) or [],
+                    occurred_start=getattr(u, "occurred_start", None),
                 )
-            return obs_list
-        except Exception:
-            return []
+            )
+        return obs_list
 
     async def close(self) -> None:
         await self.client.aclose()

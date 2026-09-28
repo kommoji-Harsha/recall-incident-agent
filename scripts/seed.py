@@ -44,7 +44,7 @@ async def seed():
 
         print(f"Loaded {len(incidents)} incidents from {incidents_path}")
 
-        # Seed incidents in batches
+        # Seed incidents in batches with per-item document_id
         items = []
         for inc in incidents:
             content_text = (
@@ -63,7 +63,6 @@ async def seed():
 
             content_text += "\nLogs:\n" + "\n".join(inc.get("logs", []))
 
-            # Ensure all metadata values are strings
             metadata = {
                 "incident_id": str(inc["id"]),
                 "service": str(inc["service"]),
@@ -79,16 +78,16 @@ async def seed():
                 "content": content_text,
                 "timestamp": inc["timestamp"],
                 "context": f"past incident {inc['id']} for {inc['service']}",
+                "document_id": f"incident-{inc['id']}",  # Per-item unique stable document_id
                 "metadata": metadata,
                 "tags": ["incident", inc["service"], inc["severity"].lower()],
             })
 
-        print(f"Retaining batch of {len(items)} incidents with document_id='seed-incidents-batch'...")
+        print(f"Retaining batch of {len(items)} incidents with per-item document_ids...")
         await client.aretain_batch(
             bank_id=BANK_ID,
             items=items,
-            document_id="seed-incidents-batch",
-            retain_async=False
+            retain_async=False,
         )
         print("Batch incident retain complete.")
 

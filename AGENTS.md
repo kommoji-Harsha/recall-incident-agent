@@ -1,10 +1,10 @@
 # AGENTS.md - Instructions and Rules for Working on Recall
 
 ## Core Rules & Working Agreement
-- **No forbidden terms:** Never use the word "hackathon" anywhere in the repository.
+- **Forbidden words:** Never use forbidden competition/event words anywhere in the repository.
 - **Secrets:** Never commit secrets or API keys.
 - **Offline testing:** All tests must pass completely OFFLINE without network requests or API keys, using a test-only `FakeMemory` implementation behind the `MemoryBackend` Protocol.
-- **Strict production behavior:** In running production mode, the backend must use real Hindsight Cloud and real Groq services, and must **never** silently fall back to a fake memory implementation.
+- **Strict production behavior:** In running production mode, the backend must use real Hindsight Cloud and real Groq services, and must **never** silently fall back to a fake memory implementation unless `USE_FAKE_MEMORY=true` is explicitly set.
 - **Tech stack:** Python 3.11+, FastAPI, Pydantic v2, fully typed (`mypy` clean), `ruff`, `pytest`, official `groq` SDK, official `hindsight-client`.
 
 ## Hindsight SDK Rules
@@ -25,4 +25,4 @@
   - Use stable `document_id`s (`incident-<id>`, `outcome-<analysis_id>`, `postmortem-<id>`) so re-runs are idempotent.
   - All metadata dictionary values MUST be strings.
   - Set `retain_async=False` for outcomes (so subsequent recalls immediately see them).
-  - Use `retain_batch` for seed data.
+  - Use `retain_batch` for seed data with per-item `document_id`s.

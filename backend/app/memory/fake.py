@@ -16,9 +16,14 @@ class FakeMemory(MemoryBackend):
         self.postmortems: list[dict[str, Any]] = []
         self.observations: list[Observation] = []
         self.bootstrapped = False
+        self.ping_success = True
+        self.bootstrap_error: str | None = None
 
     async def bootstrap(self) -> None:
         self.bootstrapped = True
+
+    async def ping(self) -> bool:
+        return self.ping_success
 
     async def retain_incident(
         self,
@@ -44,7 +49,7 @@ class FakeMemory(MemoryBackend):
             occurred_start=timestamp.isoformat(),
             document_id=doc_id,
             source_incident_id=incident_id,
-            scores={"final": 0.9, "reranker": 0.9, "semantic": 0.9, "keyword": 0.9},
+            scores={"final": 0.9, "reranker": 0.9, "semantic": 0.9, "keyword": None},
         )
         self.memories.append(rec)
         return doc_id
@@ -72,7 +77,7 @@ class FakeMemory(MemoryBackend):
             occurred_start=timestamp.isoformat(),
             document_id=doc_id,
             source_incident_id=src_inc,
-            scores={"final": 0.95, "reranker": 0.95, "semantic": 0.95, "keyword": 0.95},
+            scores={"final": 0.95, "reranker": 0.95, "semantic": 0.95, "keyword": None},
         )
         self.memories.append(rec)
         self.outcomes.append({"analysis_id": analysis_id, "doc_id": doc_id, "metadata": meta})
@@ -100,7 +105,7 @@ class FakeMemory(MemoryBackend):
             occurred_start=timestamp.isoformat(),
             document_id=doc_id,
             source_incident_id=derive_source_incident_id(doc_id, meta),
-            scores={"final": 0.85, "reranker": 0.85, "semantic": 0.85, "keyword": 0.85},
+            scores={"final": 0.85, "reranker": 0.85, "semantic": 0.85, "keyword": None},
         )
         self.memories.append(rec)
         self.postmortems.append({"postmortem_id": postmortem_id, "content": content})
@@ -113,7 +118,6 @@ class FakeMemory(MemoryBackend):
         max_tokens: int = 4096,
         prefer_observations: bool = True,
     ) -> list[RecalledMemory]:
-        # Filter memories based on keywords in query if possible, or return all matching
         query_words = set(query.lower().split())
         matched: list[RecalledMemory] = []
         for m in self.memories:

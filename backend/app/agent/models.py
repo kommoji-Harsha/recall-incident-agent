@@ -23,6 +23,7 @@ class AnalysisOutput(BaseModel):
     fix_steps: list[FixStep] = Field(default_factory=list)
     runbooks: list[str] = Field(default_factory=list)
     memory_used: list[dict[str, Any]] = Field(default_factory=list)
+    memory_status: Literal["off", "ok", "no_match", "unavailable"] = "ok"
     warnings: list[str] = Field(default_factory=list)
     model_used: str = "memory-degraded"
 

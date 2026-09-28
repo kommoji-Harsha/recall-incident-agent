@@ -34,14 +34,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     db = Database()
 
-    # Determine memory backend based on env
     api_key = os.environ.get("HINDSIGHT_API_KEY", "").strip()
     use_fake = os.environ.get("USE_FAKE_MEMORY", "false").lower() == "true"
 
     if use_fake:
         memory_backend = FakeMemory()
     elif not api_key:
-        # Strict mode: running app with USE_FAKE_MEMORY=false must not silently fall back if key is missing
         raise RuntimeError("HINDSIGHT_API_KEY environment variable is required unless USE_FAKE_MEMORY=true is explicitly set.")
     else:
         memory_backend = HindsightMemory(
@@ -85,19 +83,20 @@ app.add_middleware(
 @app.get("/api/health")
 async def health_check() -> dict[str, Any]:
     hindsight_reachable = False
-    if memory_backend:
+    bootstrap_error = getattr(memory_backend, "bootstrap_error", None)
+
+    if memory_backend and bootstrap_error is None:
         try:
-            # Simple probe
-            await memory_backend.list_observations(limit=1)
-            hindsight_reachable = True
+            hindsight_reachable = await memory_backend.ping()
         except Exception:
             hindsight_reachable = False
 
     groq_configured = bool(llm_client and llm_client.api_key)
 
     return {
-        "status": "ok",
+        "status": "ok" if (hindsight_reachable or isinstance(memory_backend, FakeMemory)) else "degraded",
         "hindsight_reachable": hindsight_reachable,
+        "bootstrap_error": bootstrap_error,
         "groq_configured": groq_configured,
         "primary_model": llm_client.primary_model if llm_client else None,
         "fallback_model": llm_client.fallback_model if llm_client else None,
@@ -112,7 +111,6 @@ async def analyze_alert(req: AnalyzeRequest) -> AnalyzeResponse:
             detail="Backend services not initialized",
         )
 
-    # Input validation for oversized inputs
     if len(req.alert_text) > 100000:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -123,7 +121,6 @@ async def analyze_alert(req: AnalyzeRequest) -> AnalyzeResponse:
     analysis_id = f"analysis-{uuid.uuid4().hex[:8]}"
 
     if req.compare:
-        # Run memory ON and memory OFF in parallel
         mem_on_task = asyncio.create_task(
             pipeline.analyze(alert_text=req.alert_text, memory_enabled=True)
         )
@@ -236,7 +233,6 @@ async def submit_postmortem(req: PostmortemRequest) -> PostmortemResponse:
         metadata={"title": req.title or "Postmortem"},
     )
 
-    # Follow-up recall check to demonstrate extraction
     sample_recalled = await memory_backend.recall_similar(
         query=req.title or req.text[:100],
         budget="low",
