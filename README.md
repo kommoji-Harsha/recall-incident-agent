@@ -57,9 +57,9 @@ flowchart LR
 - **Observations:** Hindsight consolidates repeated patterns (for example, "Redis eviction storms follow cache-size changes") into observations that improve over time.
 - **Outcome feedback:** "fixed" and "did not work" results are retained, so failed fixes can be demoted next time.
 
-## Getting started *(planned)*
+## Getting started
 
-You will need a Hindsight Cloud API key and a Groq API key.
+You will need a Hindsight Cloud API key and a Groq API key to run with live services, or you can run completely offline in test mode using `USE_FAKE_MEMORY=true`.
 
 ```bash
 git clone https://github.com/<your-username>/recall-incident-agent.git
@@ -67,7 +67,33 @@ cd recall-incident-agent
 cp .env.example .env    # then fill in HINDSIGHT_API_KEY and GROQ_API_KEY
 ```
 
-Backend, frontend and seed-script commands will be added here once the first build lands.
+### Install dependencies
+```bash
+pip install -e backend/
+```
+
+### Seed Memory Bank
+To populate Hindsight memory with 30 synthetic historical incidents and post-mortems:
+```bash
+python scripts/seed.py
+```
+
+### Run Smoke Test
+To verify live retain and recall operations on Hindsight Cloud:
+```bash
+python scripts/smoke_hindsight.py
+```
+
+### Start Backend API Server
+```bash
+uvicorn backend.app.main:app --reload --port 8000
+```
+
+### Run Offline Tests
+All backend tests pass offline without API keys or network requests:
+```bash
+PYTHONPATH=. pytest backend/tests
+```
 
 ## Demo data
 
