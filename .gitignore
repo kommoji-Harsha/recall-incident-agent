@@ -9,9 +9,10 @@ venv/
 ENV/
 .venv
 
-# Environment
+# Environment & Logs
 .env
 .env.local
+*.log
 
 # Database
 *.db

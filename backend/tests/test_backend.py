@@ -2,9 +2,9 @@ from unittest.mock import AsyncMock, MagicMock
 
 import backend.app.main as main_mod
 import pytest
-from backend.app.agent.pipeline import IncidentAgentPipeline
+from backend.app.agent.pipeline import IncidentAgentPipeline, LLMSynthesisSchema
 from backend.app.db import Database
-from backend.app.llm.client import GroqLLMClient, LLMResult
+from backend.app.llm.client import GroqProvider
 from backend.app.main import app
 from backend.app.memory.fake import FakeMemory
 from backend.app.memory.hindsight import HindsightMemory
@@ -42,7 +42,7 @@ def client(fake_memory: FakeMemory, tmp_path) -> TestClient:
     db_file = str(tmp_path / "test_recall.db")
     main_mod.db = Database(db_path=db_file)
     main_mod.memory_backend = fake_memory
-    main_mod.llm_client = GroqLLMClient(api_key="")
+    main_mod.llm_provider = GroqProvider(api_key="")
     return TestClient(app)
 
 
@@ -69,11 +69,6 @@ def test_health_reports_unreachable_when_backend_raises(client: TestClient, fake
 
 @pytest.mark.asyncio
 async def test_sdk_recall_result_mapping_contract_test() -> None:
-    """
-    Contract test that builds real RecallResult and RecallScores objects
-    with keyword=None and string entities, passing them through HindsightMemory.recall_similar.
-    Must not raise.
-    """
     scores_obj = RecallScores(
         final=0.92,
         reranker=0.88,
@@ -143,7 +138,7 @@ async def test_memory_unavailable_status_and_warning() -> None:
         async def recall_similar(self, query: str, **kwargs) -> list[RecalledMemory]:
             raise TimeoutError("Hindsight API request timed out")
 
-    pipeline = IncidentAgentPipeline(memory=FailingRecallMemory(), llm_client=GroqLLMClient(api_key=""))
+    pipeline = IncidentAgentPipeline(memory=FailingRecallMemory(), llm_client=GroqProvider(api_key=""))
     res = await pipeline.analyze("checkout-api QueuePool limit reached", memory_enabled=True)
     assert res.memory_status == "unavailable"
     assert any("Memory unavailable: answer generated without history" in w for w in res.warnings)
@@ -151,11 +146,10 @@ async def test_memory_unavailable_status_and_warning() -> None:
 
 @pytest.mark.asyncio
 async def test_citation_grounding_drops_fake_citations(fake_memory: FakeMemory) -> None:
-    pipeline = IncidentAgentPipeline(memory=fake_memory, llm_client=GroqLLMClient(api_key=""))
+    pipeline = IncidentAgentPipeline(memory=fake_memory, llm_client=GroqProvider(api_key=""))
 
     class MockLLM:
-        async def generate_structured(self, prompt: str, response_model: type, **kwargs) -> LLMResult:
-            from backend.app.agent.pipeline import LLMSynthesisSchema
+        async def complete_json(self, system: str, user: str, schema: type) -> tuple[LLMSynthesisSchema, str]:
             fake_schema = LLMSynthesisSchema(
                 root_cause_summary="DB pool exhausted",
                 confidence=0.9,
@@ -171,7 +165,7 @@ async def test_citation_grounding_drops_fake_citations(fake_memory: FakeMemory) 
                 ],
                 suggested_runbooks=["runbook-db.md"],
             )
-            return LLMResult(data=fake_schema, model_used="mock-model", warnings=[])
+            return fake_schema, "mock-model"
 
     pipeline.llm_client = MockLLM()  # type: ignore
 
@@ -184,11 +178,10 @@ async def test_citation_grounding_drops_fake_citations(fake_memory: FakeMemory) 
 
 @pytest.mark.asyncio
 async def test_jaccard_failed_fix_demotion(fake_memory: FakeMemory) -> None:
-    pipeline = IncidentAgentPipeline(memory=fake_memory, llm_client=GroqLLMClient(api_key=""))
+    pipeline = IncidentAgentPipeline(memory=fake_memory, llm_client=GroqProvider(api_key=""))
 
     class MockLLM:
-        async def generate_structured(self, prompt: str, response_model: type, **kwargs) -> LLMResult:
-            from backend.app.agent.pipeline import LLMSynthesisSchema
+        async def complete_json(self, system: str, user: str, schema: type) -> tuple[LLMSynthesisSchema, str]:
             fake_schema = LLMSynthesisSchema(
                 root_cause_summary="DB pool exhausted",
                 confidence=0.9,
@@ -211,7 +204,7 @@ async def test_jaccard_failed_fix_demotion(fake_memory: FakeMemory) -> None:
                 ],
                 suggested_runbooks=[],
             )
-            return LLMResult(data=fake_schema, model_used="mock-model", warnings=[])
+            return fake_schema, "mock-model"
 
     pipeline.llm_client = MockLLM()  # type: ignore
 
@@ -225,7 +218,7 @@ async def test_jaccard_failed_fix_demotion(fake_memory: FakeMemory) -> None:
 @pytest.mark.asyncio
 async def test_no_similar_incident_path() -> None:
     empty_mem = FakeMemory(initial_memories=[])
-    pipeline = IncidentAgentPipeline(memory=empty_mem, llm_client=GroqLLMClient(api_key=""))
+    pipeline = IncidentAgentPipeline(memory=empty_mem, llm_client=GroqProvider(api_key=""))
 
     res = await pipeline.analyze("unusual_unknown_exotic_error_xyz_123", memory_enabled=True)
     assert res.memory_status == "no_match"

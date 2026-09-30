@@ -17,20 +17,20 @@ from backend.app.agent.models import (
 )
 from backend.app.agent.pipeline import IncidentAgentPipeline
 from backend.app.db import Database
-from backend.app.llm.client import GroqLLMClient
+from backend.app.llm.client import LLMProvider, get_llm_provider
 from backend.app.memory.fake import FakeMemory
 from backend.app.memory.hindsight import HindsightMemory
 from backend.app.memory.protocol import MemoryBackend
 
 # Global instances
 memory_backend: MemoryBackend | None = None
-llm_client: GroqLLMClient | None = None
+llm_provider: LLMProvider | None = None
 db: Database | None = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    global memory_backend, llm_client, db
+    global memory_backend, llm_provider, db
 
     db = Database()
 
@@ -51,12 +51,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     await memory_backend.bootstrap()
 
-    llm_client = GroqLLMClient(
-        api_key=os.environ.get("GROQ_API_KEY", ""),
-        primary_model=os.environ.get("GROQ_PRIMARY_MODEL", "openai/gpt-oss-120b"),
-        fallback_model=os.environ.get("GROQ_FALLBACK_MODEL", "qwen/qwen3-32b"),
-        timeout=float(os.environ.get("GROQ_TIMEOUT_SECONDS", "30.0")),
-    )
+    llm_provider = get_llm_provider()
 
     yield
 
@@ -91,21 +86,22 @@ async def health_check() -> dict[str, Any]:
         except Exception:
             hindsight_reachable = False
 
-    groq_configured = bool(llm_client and llm_client.api_key)
+    llm_configured = bool(llm_provider and llm_provider.api_key)
 
     return {
         "status": "ok" if (hindsight_reachable or isinstance(memory_backend, FakeMemory)) else "degraded",
         "hindsight_reachable": hindsight_reachable,
         "bootstrap_error": bootstrap_error,
-        "groq_configured": groq_configured,
-        "primary_model": llm_client.primary_model if llm_client else None,
-        "fallback_model": llm_client.fallback_model if llm_client else None,
+        "groq_configured": llm_configured,
+        "llm_provider": os.environ.get("LLM_PROVIDER", "groq"),
+        "primary_model": llm_provider.primary_model if llm_provider else None,
+        "fallback_model": llm_provider.fallback_model if llm_provider else None,
     }
 
 
 @app.post("/api/analyze", response_model=AnalyzeResponse)
 async def analyze_alert(req: AnalyzeRequest) -> AnalyzeResponse:
-    if not memory_backend or not llm_client or not db:
+    if not memory_backend or not llm_provider or not db:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Backend services not initialized",
@@ -117,7 +113,7 @@ async def analyze_alert(req: AnalyzeRequest) -> AnalyzeResponse:
             detail="Alert text exceeds max length limit of 100,000 characters",
         )
 
-    pipeline = IncidentAgentPipeline(memory=memory_backend, llm_client=llm_client)
+    pipeline = IncidentAgentPipeline(memory=memory_backend, llm_client=llm_provider)
     analysis_id = f"analysis-{uuid.uuid4().hex[:8]}"
 
     if req.compare:

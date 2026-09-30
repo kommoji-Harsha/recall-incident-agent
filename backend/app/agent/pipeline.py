@@ -1,4 +1,3 @@
-import asyncio
 import json
 import logging
 import re
@@ -7,7 +6,7 @@ from typing import Any, Literal, Sequence
 from pydantic import BaseModel, Field
 
 from backend.app.agent.models import AnalysisOutput, FixStep, RootCause
-from backend.app.llm.client import GroqLLMClient
+from backend.app.llm.client import LLMProvider, get_llm_provider
 from backend.app.memory.protocol import MemoryBackend, RecalledMemory
 
 logger = logging.getLogger(__name__)
@@ -43,10 +42,10 @@ class IncidentAgentPipeline:
     def __init__(
         self,
         memory: MemoryBackend,
-        llm_client: GroqLLMClient | None = None,
+        llm_client: LLMProvider | None = None,
     ) -> None:
         self.memory = memory
-        self.llm_client = llm_client or GroqLLMClient()
+        self.llm_client = llm_client or get_llm_provider()
 
     async def analyze(
         self,
@@ -80,6 +79,7 @@ class IncidentAgentPipeline:
                 logger.warning(f"Recall attempt {attempt + 1} failed: {exc}")
                 recall_failed = True
                 if attempt == 0:
+                    import asyncio
                     await asyncio.sleep(1.0)
 
         if recall_failed:
@@ -94,7 +94,7 @@ class IncidentAgentPipeline:
                 memory_status="no_match",
             )
 
-        # Memories found: call LLM or fall back to degraded response
+        # Memories found: call LLM provider or fall back to degraded response
         try:
             return await self._synthesize_with_llm(
                 alert_text=alert_text_clean,
@@ -180,14 +180,13 @@ class IncidentAgentPipeline:
             "You are an incident response agent. Output strictly valid JSON matching the requested schema."
         )
 
-        llm_res = await self.llm_client.generate_structured(
-            prompt=prompt,
-            response_model=LLMSynthesisSchema,
-            system_prompt=system_prompt,
+        parsed, model_used = await self.llm_client.complete_json(
+            system=system_prompt,
+            user=prompt,
+            schema=LLMSynthesisSchema,
         )
 
-        parsed: LLMSynthesisSchema = llm_res.data
-        warnings = list(llm_res.warnings)
+        warnings: list[str] = []
 
         grounded_rc_sources = [
             sid for sid in parsed.root_cause_sources if sid in valid_incident_ids or sid in valid_memory_ids
@@ -196,8 +195,7 @@ class IncidentAgentPipeline:
         raw_fix_steps = parsed.proposed_fix_steps
         processed_fix_steps: list[FixStep] = []
 
-        # Build list of failed attempt text fragments from memories
-        failed_texts: list[tuple[str, str]] = []  # (failed_text_fragment, source_incident)
+        failed_texts: list[tuple[str, str]] = []
         for m in recalled_memories:
             is_failed_mem = (
                 m.metadata.get("result") in ["didnt_work", "failed"]
@@ -206,7 +204,6 @@ class IncidentAgentPipeline:
             )
             if is_failed_mem:
                 failed_inc = m.source_incident_id or "INC-unknown"
-                # Split memory text into lines or sentences containing failure indicators
                 for paragraph in m.text.split(". "):
                     if "FAILED" in paragraph or "Tried First" in paragraph or "did not work" in paragraph.lower():
                         failed_texts.append((paragraph, failed_inc))
@@ -228,7 +225,6 @@ class IncidentAgentPipeline:
             if prior_outcome not in ["worked", "failed", "unknown"]:
                 prior_outcome = "unknown"
 
-            # Deterministic Jaccard token overlap check against failed attempts
             for f_text, f_inc in failed_texts:
                 sim = jaccard_similarity(step_text, f_text)
                 if sim >= 0.5:
@@ -248,7 +244,6 @@ class IncidentAgentPipeline:
                 )
             )
 
-        # Demote failed fix steps to bottom rank
         working_steps: list[FixStep] = []
         failed_steps: list[FixStep] = []
 
@@ -289,7 +284,7 @@ class IncidentAgentPipeline:
             memory_used=memory_used,
             memory_status="ok",
             warnings=warnings,
-            model_used=llm_res.model_used,
+            model_used=model_used,
         )
 
     async def _synthesize_no_memory_or_generic(
@@ -303,7 +298,7 @@ class IncidentAgentPipeline:
         elif memory_status == "unavailable":
             warnings.append("Memory unavailable: answer generated without history")
             recalled_section = "none provided (memory service unavailable)"
-        else:  # no_match
+        else:
             warnings.append("No matching historical incidents found in memory.")
             recalled_section = "none provided (no matching history found)"
 
@@ -338,12 +333,11 @@ class IncidentAgentPipeline:
 
         if self.llm_client and self.llm_client.api_key:
             try:
-                llm_res = await self.llm_client.generate_structured(
-                    prompt=prompt,
-                    response_model=LLMSynthesisSchema,
-                    system_prompt=system_prompt,
+                parsed, model_used = await self.llm_client.complete_json(
+                    system=system_prompt,
+                    user=prompt,
+                    schema=LLMSynthesisSchema,
                 )
-                parsed: LLMSynthesisSchema = llm_res.data
 
                 fix_steps = [
                     FixStep(
@@ -367,13 +361,12 @@ class IncidentAgentPipeline:
                     runbooks=parsed.suggested_runbooks,
                     memory_used=[],
                     memory_status=memory_status,
-                    warnings=warnings + llm_res.warnings,
-                    model_used=llm_res.model_used,
+                    warnings=warnings,
+                    model_used=model_used,
                 )
             except Exception as exc:
                 logger.warning(f"Generic LLM synthesis failed: {exc}")
 
-        # Static offline fallback when no LLM available or LLM fails
         return AnalysisOutput(
             likely_root_cause=RootCause(
                 text="[no matching history] Potential service degradation or resource constraint detected.",
